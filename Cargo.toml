@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.21.0-rc.1"
+version = "0.21.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -35,7 +35,7 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.9.4" }
+ant-protocol = "3.1.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.28.0"
