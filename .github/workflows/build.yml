@@ -46,3 +46,55 @@ jobs:
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
+
+  # Packages the binary as the Docker image home operators run, pushes it to
+  # GitHub's container registry (private, like this repo), and checks that a
+  # container starts, joins the network and stops cleanly.
+  image:
+    needs: linux-x64
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/project-dspace/storage-node
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ant-node-linux-x64
+
+      - name: Unpack build
+        run: mkdir dist && tar -xzf ant-node-linux-x64.tar.gz -C dist
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Smoke test
+        run: |
+          docker run -d --name smoke --network host \
+            -e REWARDS_ADDRESS=0x3543E4c2F83447bB7220C08453b3611b7513D52C \
+            -e NODE_COUNT=1 -e PORT_START=10900 \
+            -v "$PWD/smoke-data:/data" "$IMAGE:${{ github.sha }}"
+          joined=no
+          for _ in $(seq 1 60); do
+            if docker logs smoke 2>&1 | grep -qE 'Successfully connected to [1-9]'; then joined=yes; break; fi
+            sleep 2
+          done
+          docker logs smoke 2>&1 | grep -vE '^\s*$' | head -15
+          start=$(date +%s); docker stop -t 30 smoke >/dev/null
+          echo "joined the network: $joined; stopped in $(( $(date +%s) - start ))s"
+          [ "$joined" = yes ]
