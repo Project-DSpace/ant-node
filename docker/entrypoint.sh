@@ -193,6 +193,10 @@ for attempt in $(seq 1 60); do
     (( attempt < 60 )) || fail "The node manager did not answer on 127.0.0.1:$MANAGER_PORT within a minute"
     sleep 1
 done
+# Another container on the same host network may already use the port.
+sleep 2
+kill -0 "$manager_pid" 2>/dev/null || fail "The node manager failed to start (is MANAGER_PORT $MANAGER_PORT already in use?); see $LOGS/manager.*.log"
+
 
 # Stream the newest log file of every node (they rotate daily) and of the
 # manager to the container log, re-checking for new files every minute.

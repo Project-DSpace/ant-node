@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests the storage-node image on a small isolated network, never the live one:
 # a seed node with no bootstrap peers, plus test containers that bootstrap only
-# from it. Run by CI after building the image; needs Docker with host networking.
+# from it. Containers sharing the host network need their own MANAGER_PORT. Run by CI after building the image; needs Docker with host networking.
 #
 #   docker/smoke-test.sh <image>
 #
@@ -42,13 +42,13 @@ peer_ids() { sudo sh -c "cat $1/nodes/node-*/webrtc-direct.multiaddr" 2>/dev/nul
 registry() { sudo jq -r "$2" "$1/manager/ant/node_registry.json"; }
 
 echo "== seed node (no bootstrap peers: starts an isolated network)"
-docker run -d --name seed "${COMMON[@]}" -e NODE_COUNT=1 -e PORT_START=10900 -e BOOTSTRAP_PEERS="" \
+docker run -d --name seed "${COMMON[@]}" -e MANAGER_PORT=12601 -e NODE_COUNT=1 -e PORT_START=10900 -e BOOTSTRAP_PEERS="" \
     -v "$WORK/seed:/data" "$IMAGE" >/dev/null
 wait_for seed 'Running 1 node' 1 60 || fail "seed did not start"
 
 echo "== three nodes joining the seed, browser ports 11910-11912"
 run_smoke() { # node_count
-    docker run -d --name smoke "${COMMON[@]}" -e NODE_COUNT=$1 -e PORT_START=10910 \
+    docker run -d --name smoke "${COMMON[@]}" -e MANAGER_PORT=12602 -e NODE_COUNT=$1 -e PORT_START=10910 \
         -e BROWSER_PORT_START=11910 -e PUBLIC_IP=$IP -e BOOTSTRAP_PEERS="$IP:10900" \
         -v "$WORK/smoke:/data" "$IMAGE" >/dev/null
 }
@@ -93,7 +93,7 @@ echo "stopped in ${took}s, exit code $code"
 (( $(count smoke 'Stopping nodes') >= 1 )) || fail "nodes were not stopped by the entrypoint"
 
 echo "== disk-pressure eviction on a 1.5 GB disk"
-docker run -d --name evict "${COMMON[@]}" --tmpfs /data:rw,size=1500m -e NODE_COUNT=3 -e PORT_START=10930 \
+docker run -d --name evict "${COMMON[@]}" -e MANAGER_PORT=12603 --tmpfs /data:rw,size=1500m -e NODE_COUNT=3 -e PORT_START=10930 \
     -e BOOTSTRAP_PEERS="$IP:10900" "$IMAGE" >/dev/null
 wait_for evict 'Running 3 node' 1 60 || fail "eviction test nodes did not start"
 (( $(count evict 'WARNING: only [0-9]+ GiB free') >= 1 )) || fail "no low-disk warning at startup"
