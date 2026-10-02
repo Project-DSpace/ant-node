@@ -1,17 +1,11 @@
-# Autonomi Network — Bootstrap Peers
+# Bootstrap Peers
 #
-# This file provides initial peers for joining the production network.
-# It is loaded automatically when no --bootstrap CLI argument is provided.
+# Empty in this fork. Upstream ships Autonomi's production bootstrap peers here,
+# and nodes load this file when no --bootstrap argument is given, so a node left
+# unconfigured would join Autonomi's network instead of ours. Our nodes always
+# pass their bootstrap peers explicitly, through --bootstrap or their config file.
 #
 # Format: "ip:port" socket addresses.
 # Port range for ant-node: 10000-10999.
 
-peers = [
-    "207.148.94.42:10000",
-    "45.77.50.10:10000",
-    "66.135.23.83:10000",
-    "149.248.9.2:10000",
-    "49.12.119.240:10000",
-    "5.161.25.133:10000",
-    "18.228.202.183:10000",
-]
+peers = []

@@ -732,16 +732,11 @@ impl BootstrapPeersConfig {
 
 /// Default testnet bootstrap nodes.
 ///
-/// These are well-known bootstrap nodes for the Autonomi testnet.
-/// - ant-bootstrap-1 (NYC): 165.22.4.178:12000
-/// - ant-bootstrap-2 (SFO): 164.92.111.156:12000
+/// Empty in this fork. Upstream lists Autonomi's own testnet bootstrap nodes here,
+/// so a node started without `bootstrap` would join Autonomi's testnet instead of
+/// ours. Every node must name our bootstrap peers explicitly.
 fn default_testnet_bootstrap() -> Vec<SocketAddr> {
-    vec![
-        // ant-bootstrap-1 (Digital Ocean NYC1)
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(165, 22, 4, 178), 12000)),
-        // ant-bootstrap-2 (Digital Ocean SFO3)
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(164, 92, 111, 156), 12000)),
-    ]
+    Vec::new()
 }
 
 #[cfg(test)]
