@@ -256,3 +256,7 @@ cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
 
+
+# Autonomi's protocol crate with our price multiplier; see vendor/ant-protocol/VENDORED.md.
+[patch.crates-io]
+ant-protocol = { path = "vendor/ant-protocol" }
