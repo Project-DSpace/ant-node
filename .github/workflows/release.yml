@@ -1,0 +1,162 @@
+# Builds, signs and publishes the Linux x86_64 release that running nodes
+# install by themselves (src/upgrade/), the way Autonomi releases ant-node,
+# cut down to our one platform. Runs when a person pushes a version tag:
+#
+#   git tag -a v0.21.0+ds.2 -m v0.21.0+ds.2 && git push origin v0.21.0+ds.2
+#
+# Versions are <upstream base>+ds.<build>: nodes order build metadata, so
+# 0.21.0 < 0.21.0+ds.1 < 0.21.0+ds.2 < 0.21.1 < 0.21.1+ds.1. Bump Cargo.toml
+# (and Cargo.lock's ant-node entry) with every node code change, then tag it:
+# a running node only takes a release whose version is higher than its own.
+#
+# The tag has to come from a person: GitHub won't let GITHUB_TOKEN create a tag
+# on a commit that changes .github/workflows, so this only publishes an
+# existing tag. The signing key is the RELEASE_SIGNING_KEY_HEX secret of the
+# `release` environment, which only v*+ds.* tags can use.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*\+ds.*']
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # The servers' Ubuntu release: a binary built against a newer glibc will
+    # not start on an older one, and nothing rolls a node back if it can't.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag that differs from the version compiled into the binary would make
+      # every node reinstall the release over and over.
+      - name: Check tag, version and release key
+        id: check
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+ds\.[1-9][0-9]*$ ]]; then
+            echo "::error::$tag is not vX.Y.Z+ds.N"
+            exit 1
+          fi
+          version="${tag#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "::error::Cargo.toml has $cargo_version, the tag is $tag"
+            exit 1
+          fi
+          # The key compiled into the node must be the published public key.
+          sed -n '/^const RELEASE_SIGNING_KEY/,/^];/p' src/upgrade/signature.rs \
+            | grep -oE '0x[0-9a-f]{2}' | sed 's/0x//' | tr -d '\n' | xxd -r -p > "$RUNNER_TEMP/embedded.pub"
+          if ! cmp -s "$RUNNER_TEMP/embedded.pub" sign/release-signing-key.pub; then
+            echo "::error::RELEASE_SIGNING_KEY in src/upgrade/signature.rs is not sign/release-signing-key.pub"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --bin ant-node
+
+      # What a node runs to see whether a sibling already installed the upgrade.
+      - name: Check the binary's version
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          reported=$(target/release/ant-node --version)
+          if [[ "$reported" != "ant-node $VERSION" ]]; then
+            echo "::error::the binary reports '$reported'"
+            exit 1
+          fi
+
+      # Same name and layout as Autonomi's release: nodes find the archive by
+      # "linux-x64" and take the file named ant-node out of it.
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/ant-node config/bootstrap_peers.toml dist/
+          tar -C dist -czf ant-node-cli-linux-x64.tar.gz ant-node bootstrap_peers.toml
+          cp sign/release-signing-key.pub .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-unsigned
+          path: |
+            ant-node-cli-linux-x64.tar.gz
+            release-signing-key.pub
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-unsigned
+
+      - name: Install ant-keygen 0.1.0
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ant-keygen.tar.gz" \
+            https://github.com/WithAutonomi/ant-keygen/releases/download/v0.1.0/ant-keygen-linux-x64.tar.gz
+          echo "1e81922c3b3d383db0bb8039d6f13363de013b64f80e50280798461ce9e8fcf0  $RUNNER_TEMP/ant-keygen.tar.gz" \
+            | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/ant-keygen.tar.gz" -C "$RUNNER_TEMP" ant-keygen
+
+      - name: Sign
+        env:
+          SIGNING_KEY_HEX: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}
+        run: |
+          umask 077
+          keygen="$RUNNER_TEMP/ant-keygen"
+          key="$RUNNER_TEMP/release.secret"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$SIGNING_KEY_HEX" | "$keygen" verify-key > /dev/null
+          printf '%s' "$SIGNING_KEY_HEX" | xxd -r -p > "$key"
+          "$keygen" sign --key "$key" \
+            --input ant-node-cli-linux-x64.tar.gz --output ant-node-cli-linux-x64.tar.gz.sig
+          # The check a node makes, with the key compiled into this release.
+          "$keygen" verify --key release-signing-key.pub \
+            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig
+          sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt
+
+      # Nodes fail to read the whole release list if any release has no title
+      # or no notes, so both are always set.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          printf '%s\n' \
+            "Storage node $TAG for Linux x86_64 (Ubuntu 24.04 or newer)." \
+            "" \
+            "Running nodes install it by themselves within the staged-rollout window." \
+            "The archive is signed with ML-DSA-65; check it with:" \
+            "ant-keygen verify --key release-signing-key.pub --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig" \
+            > notes.md
+          gh release create "$TAG" --verify-tag --latest \
+            --title "Storage node $TAG" --notes-file notes.md \
+            ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig \
+            SHA256SUMS.txt release-signing-key.pub

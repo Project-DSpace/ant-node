@@ -54,14 +54,6 @@ const MIGRATION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_
 /// The point is to stop new legacy reads starting, not to see every last one through.
 const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether nodes check for and install new releases on their own.
-///
-/// Off in this fork. Upstream nodes poll `WithAutonomi/ant-node` releases and install
-/// anything signed with Autonomi's release key, which would replace this build with
-/// upstream's. Turn it back on only once `default_github_repo` points at our own repo
-/// and `RELEASE_SIGNING_KEY` holds our own public key.
-const AUTO_UPGRADE_ENABLED: bool = false;
-
 /// Builder for constructing an Ant node.
 pub struct NodeBuilder {
     config: NodeConfig,
@@ -157,13 +149,10 @@ impl NodeBuilder {
             .await
             .map_err(|e| Error::Startup(format!("Failed to create P2P node: {e}")))?;
 
-        // Create upgrade monitor (disabled in this fork, see AUTO_UPGRADE_ENABLED)
-        let upgrade_monitor = if AUTO_UPGRADE_ENABLED {
+        // Create upgrade monitor
+        let upgrade_monitor = {
             let node_id_seed = p2p_node.peer_id().as_bytes();
             Some(Self::build_upgrade_monitor(&self.config, node_id_seed))
-        } else {
-            info!("Auto-upgrade disabled in this build");
-            None
         };
 
         let repl_config = ReplicationConfig::default();
