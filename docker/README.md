@@ -1,13 +1,17 @@
 # Running storage nodes on Unraid
 
 This sets up storage nodes for our network in a Docker container on your Unraid
-server. It takes about 15 minutes. You'll need:
+server. Inside the container, Autonomi's own node manager runs the nodes, the
+same way Autonomi's operators run theirs. It takes about 15 minutes. You'll need:
 
 - A **GitHub account** (free), to download the private image.
 - A **wallet address** for your storage fees: any Ethereum-style address
   starting with `0x`, for example from MetaMask.
 - **Access to your router**, to forward some UDP ports.
-- An **SSD cache pool** on Unraid for the node data (recommended).
+- **Spare disk space**: at least 20 GB per node (about 35 GB recommended), plus
+  for each node some memory, CPU and part of your internet connection.
+  Autonomi's guide for a node computer is a 4-core CPU, 8 GB of RAM and 8 Mbps
+  up and down.
 
 We're in a test phase: fees are paid in a test token with no real value yet.
 
@@ -51,16 +55,17 @@ for downloading updates.)
 ## 4. Forward the ports on your router
 
 Each node uses two UDP ports: one for the storage network and one for web
-browsers fetching files. With 6 nodes, forward **UDP 10000–10005** and **UDP
-11000–11005** to your Unraid server's local IP address. The exact menu depends
+browsers fetching files. With 2 nodes, forward **UDP 10000–10001** and **UDP
+11000–11001** to your Unraid server's local IP address (with 6 nodes,
+10000–10005 and 11000–11005). The exact menu depends
 on your router; it is usually called "Port forwarding" or "Virtual servers".
 Use the same port numbers outside and inside.
 
 Use either manual forwarding or your router's automatic forwarding (UPnP) for
-ports 10000–10005, not both: the nodes ask UPnP-capable routers for those
+the storage ports, not both: the nodes ask UPnP-capable routers for those
 ports themselves, and a manual rule on the same ports makes the router hand
-them random ones instead. If your router has UPnP on, forward only
-11000–11005 by hand.
+them random ones instead. If your router has UPnP on, forward only the browser
+ports by hand.
 
 If you can't forward the browser ports, set **First browser UDP port** to `0`: the nodes then store and earn as
 usual, but don't serve web browsers.
@@ -74,24 +79,24 @@ usual, but don't serve web browsers.
    the Template list.
 3. Fill in:
    - **Rewards wallet**: your `0x…` address.
-   - **Number of nodes**: 6 (the maximum for now), or fewer on a slow connection.
-   - **Storage limit (GB)**: the most disk space all the nodes together may use
-     (1000 = 1 TB). They stop taking new data at the limit. `0` means no limit:
-     they fill the disk up to its last 500 MB.
-   - **Data folder**: leave `/mnt/cache/appdata/storage-node` if you have a cache
-     pool. Otherwise pick a folder on one specific disk or pool, such as
-     `/mnt/disk1/storage-node`, not `/mnt/user/...`: the nodes measure free space
-     where the folder is, and `/mnt/user` can show the whole array's free space
-     instead of the disk the data really lands on.
+   - **Number of nodes**: start with one or two, and add more later as your
+     disk, memory and connection allow (6 at most for now). Each node needs at
+     least 20 GB of free disk space.
+   - **Data folder**: the default `/mnt/user/appdata/storage-node` is fine if
+     your `appdata` share can spill over to the array (**Shares → appdata**,
+     Secondary storage set to Array). If `appdata` lives only on a cache drive,
+     pick a folder on the disk you want the nodes to use instead: the nodes
+     measure free space where the folder is, and on `/mnt/user` that's the
+     whole array's free space.
 4. Click **Apply**. Unraid downloads the image and starts the nodes.
 
 Without the template file, fill in Add Container by hand instead: Repository
 `ghcr.io/project-dspace/storage-node:latest`, Network Type **Host**, a path
-`/data` → `/mnt/cache/appdata/storage-node`, and variables `REWARDS_ADDRESS`
-(your wallet), `NODE_COUNT` (6), `STORAGE_LIMIT_GB` (the limit in GB) and
-`BROWSER_PORT_START` (11000). Under
+`/data` → `/mnt/user/appdata/storage-node`, and variables `REWARDS_ADDRESS`
+(your wallet), `NODE_COUNT` (2) and `BROWSER_PORT_START` (11000). Under
 **Advanced view → Extra Parameters**, add
-`--ulimit nofile=65536:65536 --stop-timeout 60`.
+`--ulimit nofile=65536:65536 --stop-timeout 120` (stopping the nodes cleanly
+can take a minute or two).
 
 ## 6. Check it's working
 
@@ -99,10 +104,10 @@ On the Docker tab, click the container's icon and choose **Logs**. Within a
 minute you should see:
 
 ```
-Storage limit: 500 GB for all nodes together (0 GB used so far, … GB free on the disk)
-Started 6 node(s) on UDP ports 10000-10005; storage fees go to 0x…
-Browser access on UDP ports 11000-11005; forward these too
-[node 10000] … Successfully connected to 2 bootstrap peers
+Added node on UDP port 10000
+Added node on UDP port 10001
+Running 2 node(s) on UDP ports 10000-10001; browser access: UDP 11000-11001; storage fees go to 0x…
+[node-1] … Successfully connected to 2 bootstrap peers
 ```
 
 On the Docker tab the container's network should show as **host**, with the IP
@@ -121,12 +126,31 @@ can confirm from the network side that your nodes are reachable.
   network and stop earning. Restarts and reboots are fine.
 - **Stopping**: stop the container on the Docker tab. Your node data stays in the
   data folder.
-- **Changing the storage limit**: edit the container, change **Storage limit
-  (GB)** and click **Apply**. Lowering it below what the nodes already hold
-  stops new data but deletes nothing. The limit counts only the nodes' folder:
-  if other files on the same disk shrink or grow a lot, the container notices
-  within 6 hours and briefly restarts the nodes one at a time to re-apply it,
-  so expect the nodes to be within about 5% of the limit (5 GB for limits under
-  100 GB) rather than exact.
+- **Status**: in the Unraid terminal, `docker exec storage-node nodes status`
+  lists your nodes (use your container's name if it isn't `storage-node`).
+- **More or fewer nodes**: edit the container, change **Number of nodes** and
+  click **Apply**. Removed nodes' data is kept in `retired/` inside the data
+  folder for 3 days, in case you change your mind, then deleted.
+- **When the disk gets full**: like Autonomi's, the node manager watches free
+  space where the data folder is. Below 1 GB free it warns in the log; below
+  500 MB it removes the node holding the least data (never the last one) and
+  deletes that node's data, so the others have room. Removed nodes stay
+  removed: free up space, run `docker exec storage-node nodes clear-evicted`,
+  then restart the container to replace them.
 - **No IPv6?** If the logs show connection problems and your connection has no
   working IPv6, set **IPv4 only** to `true` (under "Show more settings").
+
+## Upgrading from the first version
+
+Your nodes keep their identities and data: the container takes over the old
+`node-<port>` folders on its first start. After **Apply Update**, edit the
+container and:
+
+- remove the **Storage limit** variable (nodes now use the free space on the
+  disk, like Autonomi's);
+- set **Number of nodes** to match your disk, memory and connection;
+- add the browser port variable `BROWSER_PORT_START` = `11000` and forward
+  those ports, or leave it out to keep browser access off;
+- change **Extra Parameters** to
+  `--ulimit nofile=65536:65536 --stop-timeout 120`.
+

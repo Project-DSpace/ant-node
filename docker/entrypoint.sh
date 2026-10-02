@@ -1,189 +1,233 @@
 #!/usr/bin/env bash
-# Runs NODE_COUNT storage nodes on consecutive UDP ports from PORT_START, each
-# with its own folder under /data, as the unprivileged PUID:PGID. A node that
-# exits is restarted after 10 seconds; stopping the container stops them all.
+# Runs our storage nodes with Autonomi's own node manager (`ant node`, the
+# same code as in our client fork), set up the way Autonomi's operators run
+# theirs: the operator picks how many nodes, nodes use the free space where
+# /data lives, and the manager removes a node when that disk is nearly full.
+# Added on top: our network's settings and fixed browser (WebRTC Direct)
+# ports, so home routers can forward them.
 #
-# Each node also listens for web browsers (WebRTC Direct) on a fixed UDP port
-# from BROWSER_PORT_START, in the same order, and advertises the public IP the
-# network sees for it with that port; BROWSER_PORT_START=0 turns this off.
-#
-# STORAGE_LIMIT_GB caps what the nodes together keep under /data. ant-node has
-# no size cap of its own, only a reserve of free disk space it never writes
-# into (500 MiB by default), so the limit is applied as that reserve: whatever
-# is free on the disk beyond the limit. Other files on the same disk move that
-# figure, so it is re-measured every 6 hours, and the nodes are restarted one at
-# a time when it has drifted by more than 5% of the limit (at least 5 GB, so
-# small limits don't restart the nodes over small changes).
+# On every start: check the settings, clear process files left by the last
+# run, take over nodes from the previous image's layout, move nodes onto a
+# newer node binary if the image has one, bring the manager's registry in line
+# with these settings, add or retire nodes to match NODE_COUNT, then start the
+# manager and the nodes and stream their logs. docker stop stops the nodes
+# before the manager.
 set -euo pipefail
 
+STATE=/data/manager/ant              # the manager's registry and process files
+REGISTRY=$STATE/node_registry.json
+NODES=/data/nodes                    # node-<id>: one node's data (its --root-dir)
+LOGS=/data/logs                      # node-<id>/logs: one node's daily log files
+RETIRED=/data/retired                # nodes removed by lowering NODE_COUNT, kept 3 days
+MIN_FREE_PER_NODE=$((20 * 1024 ** 3)) # Autonomi's recommended minimum per node
+
+fail() { echo "$*" >&2; exit 1; }
+as_user() { setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"; }
+manager() { as_user ant node "$@"; }
+
+# ---------- settings ----------
+
 : "${REWARDS_ADDRESS:?set REWARDS_ADDRESS to the wallet that should receive storage fees}"
-if [[ ! "$REWARDS_ADDRESS" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
-    echo "REWARDS_ADDRESS is not a wallet address: $REWARDS_ADDRESS" >&2
-    exit 1
-fi
-if [[ ! "$NODE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
-    echo "NODE_COUNT must be a whole number from 1 up" >&2
-    exit 1
-fi
-# Every chunk is stored on 7 nodes. While the network runs in testnet mode,
-# nothing keeps all 7 off one machine, so at most 6 nodes per machine keeps at
-# least one copy of everything elsewhere.
-if (( NODE_COUNT > 6 )) && [[ "$ANT_NETWORK_MODE" == testnet ]]; then
-    echo "NODE_COUNT is limited to 6 per machine while the network is in testnet mode" >&2
-    exit 1
-fi
+[[ "$REWARDS_ADDRESS" =~ ^0x[0-9a-fA-F]{40}$ ]] || fail "REWARDS_ADDRESS is not a wallet address: $REWARDS_ADDRESS"
 # Whole numbers only, read as base 10 (bash would read a leading 0 as octal).
-for name in PORT_START BROWSER_PORT_START STORAGE_LIMIT_GB; do
-    if [[ ! "${!name}" =~ ^[0-9]+$ ]]; then
-        echo "$name must be a whole number" >&2
-        exit 1
-    fi
+for name in NODE_COUNT PORT_START BROWSER_PORT_START MANAGER_PORT; do
+    [[ "${!name}" =~ ^[0-9]+$ ]] || fail "$name must be a whole number"
     printf -v "$name" '%d' "$((10#${!name}))"
 done
-if (( PORT_START < 1024 || PORT_START > 65536 - NODE_COUNT )); then
-    echo "PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535" >&2
-    exit 1
+(( NODE_COUNT >= 1 )) || fail "NODE_COUNT must be at least 1"
+# Every chunk is stored on 7 nodes. In testnet mode nothing keeps all 7 off
+# one machine, so at most 6 per machine keeps a copy of everything elsewhere.
+if (( NODE_COUNT > 6 )) && [[ "$ANT_NETWORK_MODE" == testnet ]]; then
+    fail "NODE_COUNT is limited to 6 per machine while the network is in testnet mode"
 fi
+(( PORT_START >= 1024 && PORT_START <= 65536 - NODE_COUNT )) \
+    || fail "PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535"
 if (( BROWSER_PORT_START != 0 )); then
-    if (( BROWSER_PORT_START < 1024 || BROWSER_PORT_START > 65536 - NODE_COUNT )); then
-        echo "BROWSER_PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535, or be 0 to turn browser access off" >&2
-        exit 1
+    (( BROWSER_PORT_START >= 1024 && BROWSER_PORT_START <= 65536 - NODE_COUNT )) \
+        || fail "BROWSER_PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535, or be 0 to turn browser access off"
+    (( BROWSER_PORT_START >= PORT_START + NODE_COUNT || PORT_START >= BROWSER_PORT_START + NODE_COUNT )) \
+        || fail "The browser ports ($BROWSER_PORT_START on) overlap the storage ports ($PORT_START on)"
+fi
+[[ -z "$PUBLIC_IP" || "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "PUBLIC_IP must be an IPv4 address"
+if [[ -n "${STORAGE_LIMIT_GB:-}" && "${STORAGE_LIMIT_GB:-0}" != 0 ]]; then
+    echo "STORAGE_LIMIT_GB is no longer used: like Autonomi's nodes, ours use the free space where /data lives."
+fi
+read -ra rpc_urls <<<"${RPC_URLS:-$RPC_URL}"
+(( ${#rpc_urls[@]} > 0 )) || fail "Set RPC_URL"
+read -ra bootstrap <<<"$BOOTSTRAP_PEERS"
+
+# Settings every node inherits from the manager's environment.
+export ANT_EVM_RPC_URL="${rpc_urls[0]}" ANT_METRICS_PORT=0
+[[ "$IPV4_ONLY" == true ]] && export ANT_IPV4_ONLY=true
+(( BROWSER_PORT_START == 0 )) && export ANT_DISABLE_WEBRTC_DIRECT=true
+
+# The settings that differ per node, kept in the manager's registry. Node with
+# storage port P gets browser port P - PORT_START + BROWSER_PORT_START, and the
+# RPC providers in RPC_URLS are shared out over the nodes in equal blocks.
+node_env() {
+    local port=$1 index=$(($1 - PORT_START)) env=()
+    if (( BROWSER_PORT_START != 0 )); then
+        env+=("ANT_WEBRTC_DIRECT_PORT=$((BROWSER_PORT_START + index))")
+        [[ -n "$PUBLIC_IP" ]] && env+=("ANT_WEBRTC_DIRECT_ADVERTISED_ADDR=$PUBLIC_IP:$((BROWSER_PORT_START + index))")
     fi
-    if (( BROWSER_PORT_START < PORT_START + NODE_COUNT && PORT_START < BROWSER_PORT_START + NODE_COUNT )); then
-        echo "The browser ports ($BROWSER_PORT_START on) overlap the storage ports ($PORT_START on)" >&2
-        exit 1
-    fi
+    env+=("ANT_EVM_RPC_URL=${rpc_urls[index * ${#rpc_urls[@]} / NODE_COUNT]}")
+    (IFS=,; echo "${env[*]}")
+}
+
+# ---------- disk layout ----------
+
+mkdir -p "$STATE" "$NODES" "$LOGS" "$RETIRED"
+chown "$PUID:$PGID" /data /data/manager "$STATE" "$NODES" "$LOGS" "$RETIRED"
+
+# The previous image kept node n in /data/node-<port>. Take those over in
+# port order as node-1, node-2, ... so every node keeps its identity, data and
+# browser certificate, then register them on the same ports below.
+if [[ ! -s "$REGISTRY" ]] && compgen -G "/data/node-[0-9]*" >/dev/null; then
+    id=0
+    for dir in $(ls -d /data/node-[0-9]* | sort -t- -k2 -n); do
+        id=$((id + 1))
+        echo "Taking over $(basename "$dir") as node-$id"
+        mv "$dir" "$NODES/node-$id"
+    done
 fi
 
-export ANT_REWARDS_ADDRESS="$REWARDS_ADDRESS" ANT_EVM_RPC_URL="$RPC_URL"
-bootstrap=()
-for peer in $BOOTSTRAP_PEERS; do bootstrap+=(--bootstrap "$peer"); done
-options=(--metrics-port 0 --enable-logging "${bootstrap[@]}")
-(( BROWSER_PORT_START == 0 )) && options+=(--disable-webrtc-direct)
-[[ "$IPV4_ONLY" == true ]] && options+=(--ipv4-only)
+# Process files from a previous run: process IDs start again from 1 in a new
+# container, so a stale one could match an unrelated process.
+rm -f "$STATE/daemon.pid" "$STATE/daemon.port" "$NODES"/node-*/node.pid
+find "$RETIRED" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +
 
-mkdir -p /data
-chown "$PUID:$PGID" /data
-
-GB=1000000000
-MIB=1048576
-MIN_RESERVE_MIB=500
-STORAGE_CONFIG=/tmp/storage.toml
-
-# Sets free (bytes free on the disk holding /data) and used (bytes under
-# /data). du reports an error, but still the total, when a node renames a file
-# while it counts, so only a missing number counts as failure.
-measure_data() {
-    free=$(df -B1 --output=avail /data | tail -n 1 | tr -d ' ') || true
-    used=$(du -sxB1 /data 2>/dev/null | cut -f1) || true
-    [[ "$free" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ ]]
-}
-
-# Free space (MiB) the nodes must leave on the disk for what they hold to stay
-# within the limit; never less than ant-node's own default reserve.
-limit_reserve() {
-    local reserve=$(( (free + used - STORAGE_LIMIT_GB * GB) / MIB ))
-    echo $(( reserve > MIN_RESERVE_MIB ? reserve : MIN_RESERVE_MIB ))
-}
-
-write_storage_config() {
-    printf '[storage]\ndisk_reserve_mb = %s\n' "$1" > "$STORAGE_CONFIG"
-    chmod 644 "$STORAGE_CONFIG"
-}
-
-# Re-applies the limit when free space outside the nodes has moved, restarting
-# the nodes one at a time so the network never loses them all at once.
-watch_limit() {
-    local applied=$1 latest port i
-    local tolerance=$(( STORAGE_LIMIT_GB * GB / 20 / MIB ))
-    if (( tolerance < 5 * GB / MIB )); then
-        tolerance=$(( 5 * GB / MIB ))
-    fi
-    trap 'exit 0' TERM
-    while true; do
-        # STORAGE_RECHECK_SECONDS exists for CI, which cannot wait 6 hours.
-        sleep "${STORAGE_RECHECK_SECONDS:-21600}" &
-        wait $! || true
-        if ! measure_data; then
-            echo "Couldn't measure the data folder; trying again in 6 hours" >&2
-            continue
-        fi
-        latest=$(limit_reserve)
-        if (( latest > applied + tolerance || latest < applied - tolerance )); then
-            echo "Free space outside the nodes has changed; restarting them one at a time to keep within ${STORAGE_LIMIT_GB} GB"
-            write_storage_config "$latest"
-            applied=$latest
-            for ((i = 0; i < NODE_COUNT; i++)); do
-                port=$((PORT_START + i))
-                kill -TERM "$(cat "/tmp/node-$port.pid")" 2>/dev/null || true
-                sleep 60 &
-                wait $! || true
-            done
-        fi
-    done
-}
-
-reserve=
-if (( STORAGE_LIMIT_GB > 0 )); then
-    echo "Measuring the data folder for the ${STORAGE_LIMIT_GB} GB storage limit"
-    if ! measure_data; then
-        echo "Couldn't measure free and used space in /data" >&2
-        exit 1
-    fi
-    reserve=$(limit_reserve)
-    write_storage_config "$reserve"
-    options+=(--config "$STORAGE_CONFIG")
-    if (( used >= STORAGE_LIMIT_GB * GB )); then
-        echo "Storage limit: ${STORAGE_LIMIT_GB} GB. The nodes already hold $(( used / GB )) GB, so they keep it but take no new data"
-    elif (( reserve == MIN_RESERVE_MIB )); then
-        echo "Storage limit: ${STORAGE_LIMIT_GB} GB, more than this disk has room for ($(( free / GB )) GB free), so the nodes will stop when it has 500 MB left"
-    else
-        echo "Storage limit: ${STORAGE_LIMIT_GB} GB for all nodes together ($(( used / GB )) GB used so far, $(( free / GB )) GB free on the disk)"
-    fi
-else
-    echo "Storage limit: none. The nodes will fill the disk up to its last 500 MB"
+avail=$(df -B1 --output=avail /data | tail -n 1 | tr -d ' ')
+if (( avail < NODE_COUNT * MIN_FREE_PER_NODE )); then
+    echo "WARNING: only $((avail / 1024 ** 3)) GiB free under /data, below the $((NODE_COUNT * 20)) GiB recommended for $NODE_COUNT node(s)." \
+        "Each node needs at least 20 GB of free disk space; nodes that drop below this minimum are treated as full and risk being shunned by the network."
 fi
 
-run_node() {
-    local port=$1 dir=/data/node-$1 child= browser=()
-    (( BROWSER_PORT_START > 0 )) && browser=(--webrtc-direct-port $((BROWSER_PORT_START + port - PORT_START)))
-    mkdir -p "$dir"
-    chown "$PUID:$PGID" "$dir"
-    trap '[[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null; wait; exit 0' TERM
-    while true; do
-        HOME="$dir" setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
-            /opt/ant/ant-node --root-dir "$dir" --port "$port" "${options[@]}" "${browser[@]}" \
-            > >(sed -u "s/^/[node $port] /") 2>&1 &
-        child=$!
-        echo "$child" > "/tmp/node-$port.pid"
-        wait "$child" || true
-        echo "[node $port] stopped; restarting in 10 seconds"
-        sleep 10 &
-        wait $! || true
+# A node runs its own copy of the binary (and may upgrade it itself), so give
+# it the image's binary only when that is newer than the copy it has.
+image_version=$(/opt/ant/ant-node --version | awk '{print $NF}')
+for copy in "$NODES"/node-*/ant-node; do
+    [[ -x "$copy" ]] || continue
+    current=$("$copy" --version 2>/dev/null | awk '{print $NF}') || current=0
+    if [[ "$current" != "$image_version" && "$(printf '%s\n%s\n' "$current" "$image_version" | sort -V | tail -n 1)" == "$image_version" ]]; then
+        echo "$(basename "$(dirname "$copy")"): node binary $current -> $image_version"
+        install -m 755 -o "$PUID" -g "$PGID" /opt/ant/ant-node "$copy"
+    fi
+done
+
+# ---------- registry: match the settings, then NODE_COUNT ----------
+
+if [[ -s "$REGISTRY" ]]; then
+    tmp=$(mktemp)
+    jq --arg rewards "$REWARDS_ADDRESS" --argjson boot "$(printf '%s\n' "${bootstrap[@]}" | jq -R . | jq -s 'map(select(. != ""))')" \
+        '.nodes |= with_entries(.value.rewards_address = $rewards | .value.bootstrap_peers = $boot)' \
+        "$REGISTRY" > "$tmp"
+    for id in $(jq -r '.nodes | keys[]' "$tmp"); do
+        port=$(jq -r --arg id "$id" '.nodes[$id].node_port' "$tmp")
+        env=$(node_env "$port")
+        jq --arg id "$id" --arg env "$env" '
+            .nodes[$id].env_variables |= (with_entries(select(.key
+                | IN("ANT_WEBRTC_DIRECT_PORT", "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR", "ANT_EVM_RPC_URL") | not))
+              + ($env | split(",") | map(split("=") | {key: .[0], value: (.[1:] | join("="))}) | from_entries))' \
+            "$tmp" > "$tmp.next" && mv "$tmp.next" "$tmp"
+    done
+    install -m 644 -o "$PUID" -g "$PGID" "$tmp" "$REGISTRY" && rm -f "$tmp"
+fi
+
+registered() { if [[ -s "$REGISTRY" ]]; then jq -r "$1" "$REGISTRY"; fi; }
+evicted=$(registered '[.nodes[] | select(.eviction != null)] | length')
+evicted=${evicted:-0}
+if (( evicted > 0 )); then
+    echo "$evicted node(s) were removed by the node manager because the disk was nearly full and stay removed:" \
+        "free up space, then run 'docker exec <container> nodes clear-evicted' and restart the container to replace them."
+fi
+target=$((NODE_COUNT - evicted))
+
+# Lowering NODE_COUNT retires the nodes on the highest ports; their data is
+# kept in $RETIRED for 3 days in case the change is undone.
+for id in $(registered '.nodes | to_entries | map(select(.value.eviction == null)) | sort_by(.value.node_port) | reverse | .[].key'); do
+    active=$(registered '[.nodes[] | select(.eviction == null)] | length')
+    (( active > target )) || break
+    port=$(registered ".nodes[\"$id\"].node_port")
+    echo "Retiring node-$id (port $port): NODE_COUNT is $NODE_COUNT"
+    manager dismiss "$id" >/dev/null
+    stamp=$(date -u +%Y%m%dT%H%M%S)
+    if [[ -d "$NODES/node-$id" ]]; then mv "$NODES/node-$id" "$RETIRED/$stamp-node-$id"; fi
+    if [[ -d "$LOGS/node-$id" ]]; then mv "$LOGS/node-$id" "$RETIRED/$stamp-node-$id-logs"; fi
+done
+
+# Raising it (or a first start) adds nodes on the lowest free ports.
+while :; do
+    active=$(registered '[.nodes[] | select(.eviction == null)] | length')
+    (( ${active:-0} < target )) || break
+    used=" $(registered '[.nodes[].node_port] | map(tostring) | join(" ")') "
+    for ((index = 0; index < NODE_COUNT; index++)); do
+        [[ "$used" == *" $((PORT_START + index)) "* ]] || break
+    done
+    port=$((PORT_START + index))
+    args=(--count 1 --rewards-address "$REWARDS_ADDRESS" --node-port "$port" --path /opt/ant/ant-node
+          --data-dir-path "$NODES" --log-dir-path "$LOGS" --env "$(node_env "$port")")
+    if (( ${#bootstrap[@]} > 0 )); then args+=(--bootstrap "$(IFS=,; echo "${bootstrap[*]}")"); fi
+    manager add "${args[@]}" >/dev/null
+    echo "Added node on UDP port $port"
+done
+
+# Node folders without a registered node (taken over from the old layout but
+# beyond NODE_COUNT) go to $RETIRED too, rather than sitting unused.
+for dir in "$NODES"/node-*; do
+    [[ -d "$dir" ]] || continue
+    id=${dir##*/node-}
+    if [[ "$(registered ".nodes | has(\"$id\")")" != true ]]; then
+        echo "Retiring unused $(basename "$dir")"
+        mv "$dir" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-$(basename "$dir")"
+    fi
+done
+
+# ---------- run ----------
+
+as_user ant node daemon run --listen-addr 127.0.0.1 --port "$MANAGER_PORT" --log-path "$LOGS/manager" &
+manager_pid=$!
+for _ in $(seq 1 60); do
+    manager daemon status >/dev/null 2>&1 && break
+    kill -0 "$manager_pid" 2>/dev/null || fail "The node manager failed to start; see $LOGS/manager.*.log"
+    sleep 1
+done
+
+# Stream the newest log file of every node (they rotate daily) and of the
+# manager to the container log, re-checking for new files every minute.
+follow_logs() {
+    declare -A tails
+    while :; do
+        for dir in "$LOGS"/node-*/logs "$LOGS"; do
+            newest=$(ls -t "$dir"/*.log 2>/dev/null | head -n 1 || true)
+            [[ -n "$newest" && "${tails[$dir]:-}" != "$newest" ]] || continue
+            if [[ "$dir" == "$LOGS" ]]; then label=manager; else label=$(basename "$(dirname "$dir")"); fi
+            if [[ -n "${tails[$dir]:-}" ]]; then pkill -f "tail -n 0 -F ${tails[$dir]}" || true; fi
+            tail -n 0 -F "$newest" 2>/dev/null | sed -u "s/^/[$label] /" &
+            tails[$dir]=$newest
+        done
+        sleep 60
     done
 }
+follow_logs &
+logs_pid=$!
 
-nodes=()
 shutdown() {
     echo "Stopping nodes"
-    kill -TERM "${nodes[@]}" 2>/dev/null || true
-    wait
+    manager stop >/dev/null 2>&1 || true
+    kill -INT "$manager_pid" 2>/dev/null || true
+    wait "$manager_pid" 2>/dev/null || true
+    kill "$logs_pid" 2>/dev/null || true
+    pkill -f "tail -n 0 -F" 2>/dev/null || true
     exit 0
 }
 trap shutdown TERM INT
 
-for ((i = 0; i < NODE_COUNT; i++)); do
-    run_node $((PORT_START + i)) &
-    nodes+=($!)
-done
-echo "Started $NODE_COUNT node(s) on UDP ports $PORT_START-$((PORT_START + NODE_COUNT - 1)); storage fees go to $REWARDS_ADDRESS"
-if (( BROWSER_PORT_START > 0 )); then
-    echo "Browser access on UDP ports $BROWSER_PORT_START-$((BROWSER_PORT_START + NODE_COUNT - 1)); forward these too"
-else
-    echo "Browser access: off"
-fi
-if [[ -n "$reserve" ]]; then
-    watch_limit "$reserve" &
-    nodes+=($!)
-fi
-wait
+manager start >/dev/null
+if (( BROWSER_PORT_START == 0 )); then browser=off; else browser="UDP $BROWSER_PORT_START-$((BROWSER_PORT_START + NODE_COUNT - 1))"; fi
+echo "Running $target node(s) on UDP ports $PORT_START-$((PORT_START + NODE_COUNT - 1)); browser access: $browser; storage fees go to $REWARDS_ADDRESS"
+manager status || true
+
+wait "$manager_pid" || true
+echo "The node manager stopped unexpectedly; stopping the nodes" >&2
+manager stop >/dev/null 2>&1 || true
+exit 1

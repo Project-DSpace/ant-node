@@ -89,50 +89,22 @@ jobs:
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
 
-      # One node with a 2 GB storage limit, re-measured every 20 seconds instead
-      # of every 6 hours. Filling 6 GB of the same disk outside the node's folder
-      # must make the container re-apply the limit and restart the node.
+      # Runs the image on a small isolated network (never the live one):
+      # joining, browser addresses, restarts, taking over the previous image's
+      # layout, retiring nodes, clean stops and disk-pressure eviction.
       - name: Smoke test
-        run: |
-          docker run -d --name smoke --network host \
-            -e REWARDS_ADDRESS=0x3543E4c2F83447bB7220C08453b3611b7513D52C \
-            -e NODE_COUNT=1 -e PORT_START=10900 -e BROWSER_PORT_START=11000 \
-            -e STORAGE_LIMIT_GB=2 -e STORAGE_RECHECK_SECONDS=20 \
-            -v "$PWD/smoke-data:/data" "$IMAGE:${{ github.sha }}"
-          joined='Successfully connected to [1-9]'
-          count() { docker logs smoke 2>&1 | grep -cE "$1" || true; }
-          wait_for() { for _ in $(seq 1 90); do [ "$(count "$1")" -ge "${2:-1}" ] && return 0; sleep 2; done; return 1; }
-          reserve() { docker exec smoke sed -n 's/^disk_reserve_mb = //p' /tmp/storage.toml; }
-          fail() { echo "FAILED: $1"; docker logs smoke 2>&1 | grep -vE '^\s*$' | tail -40; exit 1; }
+        run: bash docker/smoke-test.sh "$IMAGE:${{ github.sha }}"
 
-          wait_for "$joined" || fail "the node did not join the network"
-          [ "$(count 'Storage limit: 2 GB for all nodes together')" -ge 1 ] || fail "no storage limit message"
-          first=$(reserve)
-          [ "$first" -gt 500 ] || fail "reserve $first MiB was not raised for the limit"
+      # The image as a file, for loading onto our servers without registry
+      # credentials (docker load).
+      - name: Save image
+        run: docker save "$IMAGE:${{ github.sha }}" | gzip > storage-node-image.tar.gz
 
-          browser=/data/node-10900/webrtc-direct.multiaddr
-          for _ in $(seq 1 60); do docker exec smoke test -s $browser && break; sleep 2; done
-          docker exec smoke grep -qE '^/ip4/[0-9.]+/udp/11000/webrtc-direct/certhash/u[A-Za-z0-9_-]+/p2p/[0-9a-f]{64}$' $browser \
-            || fail "the node did not publish a browser address on UDP 11000"
-          echo "browser address: $(docker exec smoke cat $browser)"
-
-          fallocate -l 6G "$PWD/filler"
-          wait_for 'restarting them one at a time' || fail "the limit was not re-applied after the disk filled"
-          joins=$(count "$joined")
-          wait_for "$joined" $(( joins + 1 )) || fail "the node did not rejoin after its restart"
-          rm "$PWD/filler"
-          second=$(reserve)
-          [ $(( first - second )) -gt 5000 ] || fail "reserve went from $first to $second MiB"
-          echo "reserve: $first MiB, then $second MiB after filling 6 GB; node restarted and rejoined"
-
-          docker logs smoke 2>&1 | grep -vE '^\s*$' | grep -v 'saorsa' | head -15
-          # docker stop exits 0 even when it had to kill the container, so
-          # check the time taken and the exit code.
-          start=$(date +%s); docker stop -t 30 smoke >/dev/null; took=$(( $(date +%s) - start ))
-          code=$(docker inspect -f '{{.State.ExitCode}}' smoke)
-          echo "stopped in ${took}s with exit code $code"
-          [ "$took" -lt 25 ] || fail "shutdown took ${took}s"
-          [ "$code" -eq 0 ] || fail "container exited with code $code"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: storage-node-image
+          path: storage-node-image.tar.gz
+          retention-days: 30
 
       - name: Publish
         run: docker push "$IMAGE:${{ github.sha }}"
