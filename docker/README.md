@@ -126,6 +126,7 @@ can confirm from the network side that your nodes are reachable.
   stops new data but deletes nothing. The limit counts only the nodes' folder:
   if other files on the same disk shrink or grow a lot, the container notices
   within 6 hours and briefly restarts the nodes one at a time to re-apply it,
-  so expect the nodes to be within about 5% of the limit rather than exact.
+  so expect the nodes to be within about 5% of the limit (5 GB for limits under
+  100 GB) rather than exact.
 - **No IPv6?** If the logs show connection problems and your connection has no
   working IPv6, set **IPv4 only** to `true` (under "Show more settings").

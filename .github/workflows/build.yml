@@ -14,6 +14,12 @@ on:
 permissions:
   contents: read
 
+# A newer run for the same branch replaces an older one, so an older build
+# can never publish after a newer one.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux-x64:
     # Pinned to the servers' Ubuntu release: a binary built against a newer
@@ -90,7 +96,7 @@ jobs:
         run: |
           docker run -d --name smoke --network host \
             -e REWARDS_ADDRESS=0x3543E4c2F83447bB7220C08453b3611b7513D52C \
-            -e NODE_COUNT=1 -e PORT_START=10900 \
+            -e NODE_COUNT=1 -e PORT_START=10900 -e BROWSER_PORT_START=11000 \
             -e STORAGE_LIMIT_GB=2 -e STORAGE_RECHECK_SECONDS=20 \
             -v "$PWD/smoke-data:/data" "$IMAGE:${{ github.sha }}"
           joined='Successfully connected to [1-9]'
@@ -120,10 +126,18 @@ jobs:
           echo "reserve: $first MiB, then $second MiB after filling 6 GB; node restarted and rejoined"
 
           docker logs smoke 2>&1 | grep -vE '^\s*$' | grep -v 'saorsa' | head -15
-          start=$(date +%s); docker stop -t 30 smoke >/dev/null
-          echo "stopped in $(( $(date +%s) - start ))s"
+          # docker stop exits 0 even when it had to kill the container, so
+          # check the time taken and the exit code.
+          start=$(date +%s); docker stop -t 30 smoke >/dev/null; took=$(( $(date +%s) - start ))
+          code=$(docker inspect -f '{{.State.ExitCode}}' smoke)
+          echo "stopped in ${took}s with exit code $code"
+          [ "$took" -lt 25 ] || fail "shutdown took ${took}s"
+          [ "$code" -eq 0 ] || fail "container exited with code $code"
 
       - name: Publish
-        run: |
-          docker push "$IMAGE:${{ github.sha }}"
-          docker push "$IMAGE:latest"
+        run: docker push "$IMAGE:${{ github.sha }}"
+
+      # Only main moves :latest, which home operators update from.
+      - name: Publish as latest
+        if: github.ref == 'refs/heads/main'
+        run: docker push "$IMAGE:latest"

@@ -12,7 +12,8 @@
 # into (500 MiB by default), so the limit is applied as that reserve: whatever
 # is free on the disk beyond the limit. Other files on the same disk move that
 # figure, so it is re-measured every 6 hours, and the nodes are restarted one at
-# a time when it has drifted by more than 5% of the limit.
+# a time when it has drifted by more than 5% of the limit (at least 5 GB, so
+# small limits don't restart the nodes over small changes).
 set -euo pipefail
 
 : "${REWARDS_ADDRESS:?set REWARDS_ADDRESS to the wallet that should receive storage fees}"
@@ -31,13 +32,27 @@ if (( NODE_COUNT > 6 )) && [[ "$ANT_NETWORK_MODE" == testnet ]]; then
     echo "NODE_COUNT is limited to 6 per machine while the network is in testnet mode" >&2
     exit 1
 fi
-if [[ ! "$BROWSER_PORT_START" =~ ^[0-9]+$ ]] || (( BROWSER_PORT_START > 65535 - NODE_COUNT )); then
-    echo "BROWSER_PORT_START must be a UDP port number, or 0 to turn browser access off" >&2
+# Whole numbers only, read as base 10 (bash would read a leading 0 as octal).
+for name in PORT_START BROWSER_PORT_START STORAGE_LIMIT_GB; do
+    if [[ ! "${!name}" =~ ^[0-9]+$ ]]; then
+        echo "$name must be a whole number" >&2
+        exit 1
+    fi
+    printf -v "$name" '%d' "$((10#${!name}))"
+done
+if (( PORT_START < 1024 || PORT_START > 65536 - NODE_COUNT )); then
+    echo "PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535" >&2
     exit 1
 fi
-if [[ ! "$STORAGE_LIMIT_GB" =~ ^[0-9]+$ ]]; then
-    echo "STORAGE_LIMIT_GB must be a whole number of GB, or 0 for no limit" >&2
-    exit 1
+if (( BROWSER_PORT_START != 0 )); then
+    if (( BROWSER_PORT_START < 1024 || BROWSER_PORT_START > 65536 - NODE_COUNT )); then
+        echo "BROWSER_PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535, or be 0 to turn browser access off" >&2
+        exit 1
+    fi
+    if (( BROWSER_PORT_START < PORT_START + NODE_COUNT && PORT_START < BROWSER_PORT_START + NODE_COUNT )); then
+        echo "The browser ports ($BROWSER_PORT_START on) overlap the storage ports ($PORT_START on)" >&2
+        exit 1
+    fi
 fi
 
 export ANT_REWARDS_ADDRESS="$REWARDS_ADDRESS" ANT_EVM_RPC_URL="$RPC_URL"
@@ -55,10 +70,13 @@ MIB=1048576
 MIN_RESERVE_MIB=500
 STORAGE_CONFIG=/tmp/storage.toml
 
-# Sets free (bytes free on the disk holding /data) and used (bytes under /data).
+# Sets free (bytes free on the disk holding /data) and used (bytes under
+# /data). du reports an error, but still the total, when a node renames a file
+# while it counts, so only a missing number counts as failure.
 measure_data() {
-    free=$(df -B1 --output=avail /data | tail -n 1)
-    used=$(du -sxB1 /data | cut -f1)
+    free=$(df -B1 --output=avail /data | tail -n 1 | tr -d ' ') || true
+    used=$(du -sxB1 /data 2>/dev/null | cut -f1) || true
+    [[ "$free" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ ]]
 }
 
 # Free space (MiB) the nodes must leave on the disk for what they hold to stay
@@ -86,7 +104,10 @@ watch_limit() {
         # STORAGE_RECHECK_SECONDS exists for CI, which cannot wait 6 hours.
         sleep "${STORAGE_RECHECK_SECONDS:-21600}" &
         wait $! || true
-        measure_data
+        if ! measure_data; then
+            echo "Couldn't measure the data folder; trying again in 6 hours" >&2
+            continue
+        fi
         latest=$(limit_reserve)
         if (( latest > applied + tolerance || latest < applied - tolerance )); then
             echo "Free space outside the nodes has changed; restarting them one at a time to keep within ${STORAGE_LIMIT_GB} GB"
@@ -105,7 +126,10 @@ watch_limit() {
 reserve=
 if (( STORAGE_LIMIT_GB > 0 )); then
     echo "Measuring the data folder for the ${STORAGE_LIMIT_GB} GB storage limit"
-    measure_data
+    if ! measure_data; then
+        echo "Couldn't measure free and used space in /data" >&2
+        exit 1
+    fi
     reserve=$(limit_reserve)
     write_storage_config "$reserve"
     options+=(--config "$STORAGE_CONFIG")
