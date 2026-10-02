@@ -78,23 +78,46 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          push: true
+          load: true
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
 
+      # One node with a 2 GB storage limit, re-measured every 20 seconds instead
+      # of every 6 hours. Filling 6 GB of the same disk outside the node's folder
+      # must make the container re-apply the limit and restart the node.
       - name: Smoke test
         run: |
           docker run -d --name smoke --network host \
             -e REWARDS_ADDRESS=0x3543E4c2F83447bB7220C08453b3611b7513D52C \
             -e NODE_COUNT=1 -e PORT_START=10900 \
+            -e STORAGE_LIMIT_GB=2 -e STORAGE_RECHECK_SECONDS=20 \
             -v "$PWD/smoke-data:/data" "$IMAGE:${{ github.sha }}"
-          joined=no
-          for _ in $(seq 1 60); do
-            if docker logs smoke 2>&1 | grep -qE 'Successfully connected to [1-9]'; then joined=yes; break; fi
-            sleep 2
-          done
-          docker logs smoke 2>&1 | grep -vE '^\s*$' | head -15
+          joined='Successfully connected to [1-9]'
+          count() { docker logs smoke 2>&1 | grep -cE "$1" || true; }
+          wait_for() { for _ in $(seq 1 90); do [ "$(count "$1")" -ge "${2:-1}" ] && return 0; sleep 2; done; return 1; }
+          reserve() { docker exec smoke sed -n 's/^disk_reserve_mb = //p' /tmp/storage.toml; }
+          fail() { echo "FAILED: $1"; docker logs smoke 2>&1 | grep -vE '^\s*$' | tail -40; exit 1; }
+
+          wait_for "$joined" || fail "the node did not join the network"
+          [ "$(count 'Storage limit: 2 GB for all nodes together')" -ge 1 ] || fail "no storage limit message"
+          first=$(reserve)
+          [ "$first" -gt 500 ] || fail "reserve $first MiB was not raised for the limit"
+
+          fallocate -l 6G "$PWD/filler"
+          wait_for 'restarting them one at a time' || fail "the limit was not re-applied after the disk filled"
+          joins=$(count "$joined")
+          wait_for "$joined" $(( joins + 1 )) || fail "the node did not rejoin after its restart"
+          rm "$PWD/filler"
+          second=$(reserve)
+          [ $(( first - second )) -gt 5000 ] || fail "reserve went from $first to $second MiB"
+          echo "reserve: $first MiB, then $second MiB after filling 6 GB; node restarted and rejoined"
+
+          docker logs smoke 2>&1 | grep -vE '^\s*$' | grep -v 'saorsa' | head -15
           start=$(date +%s); docker stop -t 30 smoke >/dev/null
-          echo "joined the network: $joined; stopped in $(( $(date +%s) - start ))s"
-          [ "$joined" = yes ]
+          echo "stopped in $(( $(date +%s) - start ))s"
+
+      - name: Publish
+        run: |
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
