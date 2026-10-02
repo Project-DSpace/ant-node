@@ -186,9 +186,11 @@ done
 
 as_user ant node daemon run --listen-addr 127.0.0.1 --port "$MANAGER_PORT" --log-path "$LOGS/manager" &
 manager_pid=$!
-for _ in $(seq 1 60); do
-    manager daemon status >/dev/null 2>&1 && break
+# Ready once its API answers (`ant node daemon status` succeeds even before).
+for attempt in $(seq 1 60); do
+    curl -fsS -o /dev/null "http://127.0.0.1:$MANAGER_PORT/api/v1/status" 2>/dev/null && break
     kill -0 "$manager_pid" 2>/dev/null || fail "The node manager failed to start; see $LOGS/manager.*.log"
+    (( attempt < 60 )) || fail "The node manager did not answer on 127.0.0.1:$MANAGER_PORT within a minute"
     sleep 1
 done
 

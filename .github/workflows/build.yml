@@ -1,8 +1,12 @@
-# Builds the Linux node binary on every push to main and uploads it as a
-# workflow artifact, for deployment to our servers.
+# Builds the Linux node binary on every push to main, packages it as the
+# storage-node Docker image (run by home operators and our servers), tests the
+# image on an isolated network and publishes it.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
-# and signed multi-platform releases.
+# and multi-platform releases.
+#
+# Run by hand with `reuse_build` set to an earlier run's ID to test image
+# changes against that run's node binary instead of rebuilding it.
 
 name: Build
 
@@ -10,6 +14,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      reuse_build:
+        description: Run ID whose ant-node build to reuse (empty = build)
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -22,6 +31,7 @@ concurrency:
 
 jobs:
   linux-x64:
+    if: ${{ !inputs.reuse_build }}
     # Pinned to the servers' Ubuntu release: a binary built against a newer
     # glibc will not run on an older one.
     runs-on: ubuntu-24.04
@@ -53,13 +63,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Packages the binary as the Docker image home operators run, pushes it to
-  # GitHub's container registry (private, like this repo), and checks that a
-  # container starts, joins the network and stops cleanly.
+  # Packages the binary as the Docker image, tests it on an isolated network
+  # and pushes it to GitHub's container registry.
   image:
     needs: linux-x64
+    if: ${{ always() && (needs.linux-x64.result == 'success' || needs.linux-x64.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
       packages: write
     env:
@@ -70,6 +81,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: ant-node-linux-x64
+          run-id: ${{ inputs.reuse_build || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Unpack build
         run: mkdir dist && tar -xzf ant-node-linux-x64.tar.gz -C dist
