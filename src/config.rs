@@ -325,7 +325,7 @@ pub struct UpgradeConfig {
 /// instance with the ANT token + payment vault contracts deployed,
 /// every node points at the Anvil RPC and the deployed addresses
 /// instead of one of the public Arbitrum networks.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum EvmNetworkConfig {
     /// Arbitrum One mainnet.
@@ -343,6 +343,54 @@ pub enum EvmNetworkConfig {
         /// Deployed payment vault contract address.
         payment_vault_address: String,
     },
+}
+
+/// Prints the RPC endpoint's host only. Provider URLs often carry an API key
+/// in the path or query, and the node logs its whole config at startup.
+impl std::fmt::Debug for EvmNetworkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArbitrumOne => f.write_str("ArbitrumOne"),
+            Self::ArbitrumSepolia => f.write_str("ArbitrumSepolia"),
+            Self::Custom {
+                rpc_url,
+                payment_token_address,
+                payment_vault_address,
+            } => f
+                .debug_struct("Custom")
+                .field("rpc_host", &rpc_host(rpc_url))
+                .field("payment_token_address", payment_token_address)
+                .field("payment_vault_address", payment_vault_address)
+                .finish(),
+        }
+    }
+}
+
+/// The host of `url`, without scheme, credentials, path, query or fragment.
+fn rpc_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = &rest[..rest.find(|c| c == '/' || c == '?' || c == '#').unwrap_or(rest.len())];
+    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+}
+
+#[cfg(test)]
+mod rpc_host_tests {
+    use super::{rpc_host, EvmNetworkConfig};
+
+    #[test]
+    fn strips_keys_from_rpc_urls() {
+        assert_eq!(rpc_host("https://api.example.com/0123-key"), "api.example.com");
+        assert_eq!(rpc_host("https://user:secret@rpc.example.com:8545/x?key=1"), "rpc.example.com:8545");
+        assert_eq!(rpc_host("http://1.2.3.4:8545"), "1.2.3.4:8545");
+        let config = EvmNetworkConfig::Custom {
+            rpc_url: "https://api.example.com/secret-key".into(),
+            payment_token_address: "0x1".into(),
+            payment_vault_address: "0x2".into(),
+        };
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("secret-key"), "{printed}");
+        assert!(printed.contains("api.example.com"), "{printed}");
+    }
 }
 
 impl EvmNetworkConfig {
