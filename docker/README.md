@@ -50,10 +50,20 @@ for downloading updates.)
 
 ## 4. Forward the ports on your router
 
-Forward **UDP** ports **10000–10005** (one per node; 6 nodes use 10000–10005) to
-your Unraid server's local IP address. The exact menu depends on your router; it
-is usually called "Port forwarding" or "Virtual servers". Use the same port
-numbers outside and inside.
+Each node uses two UDP ports: one for the storage network and one for web
+browsers fetching files. With 6 nodes, forward **UDP 10000–10005** and **UDP
+11000–11005** to your Unraid server's local IP address. The exact menu depends
+on your router; it is usually called "Port forwarding" or "Virtual servers".
+Use the same port numbers outside and inside.
+
+Use either manual forwarding or your router's automatic forwarding (UPnP) for
+ports 10000–10005, not both: the nodes ask UPnP-capable routers for those
+ports themselves, and a manual rule on the same ports makes the router hand
+them random ones instead. If your router has UPnP on, forward only
+11000–11005 by hand.
+
+If you can't forward the browser ports, set **First browser UDP port** to `0`: the nodes then store and earn as
+usual, but don't serve web browsers.
 
 ## 5. Add the container
 
@@ -78,7 +88,8 @@ numbers outside and inside.
 Without the template file, fill in Add Container by hand instead: Repository
 `ghcr.io/project-dspace/storage-node:latest`, Network Type **Host**, a path
 `/data` → `/mnt/cache/appdata/storage-node`, and variables `REWARDS_ADDRESS`
-(your wallet), `NODE_COUNT` (6) and `STORAGE_LIMIT_GB` (the limit in GB). Under
+(your wallet), `NODE_COUNT` (6), `STORAGE_LIMIT_GB` (the limit in GB) and
+`BROWSER_PORT_START` (11000). Under
 **Advanced view → Extra Parameters**, add
 `--ulimit nofile=65536:65536 --stop-timeout 60`.
 
@@ -90,6 +101,7 @@ minute you should see:
 ```
 Storage limit: 500 GB for all nodes together (0 GB used so far, … GB free on the disk)
 Started 6 node(s) on UDP ports 10000-10005; storage fees go to 0x…
+Browser access on UDP ports 11000-11005; forward these too
 [node 10000] … Successfully connected to 2 bootstrap peers
 ```
 

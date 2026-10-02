@@ -104,6 +104,12 @@ jobs:
           first=$(reserve)
           [ "$first" -gt 500 ] || fail "reserve $first MiB was not raised for the limit"
 
+          browser=/data/node-10900/webrtc-direct.multiaddr
+          for _ in $(seq 1 60); do docker exec smoke test -s $browser && break; sleep 2; done
+          docker exec smoke grep -qE '^/ip4/[0-9.]+/udp/11000/webrtc-direct/certhash/u[A-Za-z0-9_-]+/p2p/[0-9a-f]{64}$' $browser \
+            || fail "the node did not publish a browser address on UDP 11000"
+          echo "browser address: $(docker exec smoke cat $browser)"
+
           fallocate -l 6G "$PWD/filler"
           wait_for 'restarting them one at a time' || fail "the limit was not re-applied after the disk filled"
           joins=$(count "$joined")

@@ -3,6 +3,10 @@
 # with its own folder under /data, as the unprivileged PUID:PGID. A node that
 # exits is restarted after 10 seconds; stopping the container stops them all.
 #
+# Each node also listens for web browsers (WebRTC Direct) on a fixed UDP port
+# from BROWSER_PORT_START, in the same order, and advertises the public IP the
+# network sees for it with that port; BROWSER_PORT_START=0 turns this off.
+#
 # STORAGE_LIMIT_GB caps what the nodes together keep under /data. ant-node has
 # no size cap of its own, only a reserve of free disk space it never writes
 # into (500 MiB by default), so the limit is applied as that reserve: whatever
@@ -27,6 +31,10 @@ if (( NODE_COUNT > 6 )) && [[ "$ANT_NETWORK_MODE" == testnet ]]; then
     echo "NODE_COUNT is limited to 6 per machine while the network is in testnet mode" >&2
     exit 1
 fi
+if [[ ! "$BROWSER_PORT_START" =~ ^[0-9]+$ ]] || (( BROWSER_PORT_START > 65535 - NODE_COUNT )); then
+    echo "BROWSER_PORT_START must be a UDP port number, or 0 to turn browser access off" >&2
+    exit 1
+fi
 if [[ ! "$STORAGE_LIMIT_GB" =~ ^[0-9]+$ ]]; then
     echo "STORAGE_LIMIT_GB must be a whole number of GB, or 0 for no limit" >&2
     exit 1
@@ -35,7 +43,8 @@ fi
 export ANT_REWARDS_ADDRESS="$REWARDS_ADDRESS" ANT_EVM_RPC_URL="$RPC_URL"
 bootstrap=()
 for peer in $BOOTSTRAP_PEERS; do bootstrap+=(--bootstrap "$peer"); done
-options=(--metrics-port 0 --disable-webrtc-direct --enable-logging "${bootstrap[@]}")
+options=(--metrics-port 0 --enable-logging "${bootstrap[@]}")
+(( BROWSER_PORT_START == 0 )) && options+=(--disable-webrtc-direct)
 [[ "$IPV4_ONLY" == true ]] && options+=(--ipv4-only)
 
 mkdir -p /data
@@ -112,13 +121,14 @@ else
 fi
 
 run_node() {
-    local port=$1 dir=/data/node-$1 child=
+    local port=$1 dir=/data/node-$1 child= browser=()
+    (( BROWSER_PORT_START > 0 )) && browser=(--webrtc-direct-port $((BROWSER_PORT_START + port - PORT_START)))
     mkdir -p "$dir"
     chown "$PUID:$PGID" "$dir"
     trap '[[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null; wait; exit 0' TERM
     while true; do
         HOME="$dir" setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
-            /opt/ant/ant-node --root-dir "$dir" --port "$port" "${options[@]}" \
+            /opt/ant/ant-node --root-dir "$dir" --port "$port" "${options[@]}" "${browser[@]}" \
             > >(sed -u "s/^/[node $port] /") 2>&1 &
         child=$!
         echo "$child" > "/tmp/node-$port.pid"
@@ -143,6 +153,11 @@ for ((i = 0; i < NODE_COUNT; i++)); do
     nodes+=($!)
 done
 echo "Started $NODE_COUNT node(s) on UDP ports $PORT_START-$((PORT_START + NODE_COUNT - 1)); storage fees go to $REWARDS_ADDRESS"
+if (( BROWSER_PORT_START > 0 )); then
+    echo "Browser access on UDP ports $BROWSER_PORT_START-$((BROWSER_PORT_START + NODE_COUNT - 1)); forward these too"
+else
+    echo "Browser access: off"
+fi
 if [[ -n "$reserve" ]]; then
     watch_limit "$reserve" &
     nodes+=($!)
