@@ -184,6 +184,12 @@ done
 
 # ---------- run ----------
 
+# Log files as they were before this start, so their old lines aren't replayed.
+declare -A log_start
+for f in "$LOGS"/*.log "$LOGS"/node-*/logs/*.log; do
+    if [[ -f "$f" ]]; then log_start[$f]=$(stat -c %s "$f"); fi
+done
+
 as_user ant node daemon run --listen-addr 127.0.0.1 --port "$MANAGER_PORT" --log-path "$LOGS/manager" &
 manager_pid=$!
 # Ready once its API answers (`ant node daemon status` succeeds even before).
@@ -199,19 +205,21 @@ kill -0 "$manager_pid" 2>/dev/null || fail "The node manager failed to start (is
 
 
 # Stream the newest log file of every node (they rotate daily) and of the
-# manager to the container log, re-checking for new files every minute.
+# manager to the container log, checking for new files every 10 seconds.
+# Files that existed before this start are streamed from where they ended.
 follow_logs() {
-    declare -A tails
+    declare -A tails following
     while :; do
-        for dir in "$LOGS"/node-*/logs "$LOGS"; do
+        for dir in "$LOGS" "$LOGS"/node-*/logs; do
             newest=$(ls -t "$dir"/*.log 2>/dev/null | head -n 1 || true)
-            [[ -n "$newest" && "${tails[$dir]:-}" != "$newest" ]] || continue
+            [[ -n "$newest" && "${following[$dir]:-}" != "$newest" ]] || continue
             if [[ "$dir" == "$LOGS" ]]; then label=manager; else label=$(basename "$(dirname "$dir")"); fi
-            if [[ -n "${tails[$dir]:-}" ]]; then pkill -f "tail -n 0 -F ${tails[$dir]}" || true; fi
-            tail -n 0 -F "$newest" 2>/dev/null | sed -u "s/^/[$label] /" &
-            tails[$dir]=$newest
+            if [[ -n "${tails[$dir]:-}" ]]; then kill "${tails[$dir]}" 2>/dev/null || true; fi
+            tail -c "+$(( ${log_start[$newest]:-0} + 1 ))" -F "$newest" 2>/dev/null > >(sed -u "s/^/[$label] /") &
+            tails[$dir]=$!
+            following[$dir]=$newest
         done
-        sleep 60
+        sleep 10
     done
 }
 follow_logs &
@@ -223,7 +231,7 @@ shutdown() {
     kill -INT "$manager_pid" 2>/dev/null || true
     wait "$manager_pid" 2>/dev/null || true
     kill "$logs_pid" 2>/dev/null || true
-    pkill -f "tail -n 0 -F" 2>/dev/null || true
+    pkill -x tail 2>/dev/null || true
     exit 0
 }
 trap shutdown TERM INT
