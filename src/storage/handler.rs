@@ -37,6 +37,7 @@ use crate::ant_protocol::{
 };
 use crate::client::compute_address;
 use crate::error::{Error, Result};
+use crate::listings::ListingService;
 use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
 use crate::pointer::PointerService;
@@ -45,6 +46,7 @@ use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::traffic::{self, ChunkRequestKind, ChunkResponseKey};
 use crate::storage::ChunkStore;
+use ant_listings::Listing;
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -349,6 +351,9 @@ pub struct AntProtocol {
     /// message to a node that does not keep pointers gets a clean refusal
     /// rather than a silent drop.
     pointers: Option<PointerService>,
+    /// Records and serves listings for the envelope chunks this node stores.
+    /// `None` on a node built without a listing store.
+    listings: Option<Arc<ListingService>>,
 }
 
 impl AntProtocol {
@@ -387,7 +392,21 @@ impl AntProtocol {
             fresh_write_tx: None,
             p2p_node: RwLock::new(None),
             pointers: None,
+            listings: None,
         }
+    }
+
+    /// Record and serve listings with `listings`.
+    #[must_use]
+    pub fn with_listing_service(mut self, listings: Arc<ListingService>) -> Self {
+        self.listings = Some(listings);
+        self
+    }
+
+    /// The listing service, if this node keeps listings.
+    #[must_use]
+    pub const fn listing_service(&self) -> Option<&Arc<ListingService>> {
+        self.listings.as_ref()
     }
 
     /// Serve pointer requests from `pointers`.
@@ -417,6 +436,9 @@ impl AntProtocol {
             // Pointers take the same self-closeness gate as chunks, judged at
             // the pointer address because that is what the network routes on.
             pointers.attach_p2p_node(Arc::clone(&node));
+        }
+        if let Some(listings) = &self.listings {
+            listings.attach_p2p_node(Arc::clone(&node));
         }
         self.payment_verifier.attach_p2p_node(node);
         debug!("AntProtocol: P2PNode attached for payment live-DHT checks and self-closeness gate");
@@ -721,6 +743,7 @@ impl AntProtocol {
     }
 
     /// Inner body of `handle_put` — see the wrapper for the per-RPC latency log.
+    #[allow(clippy::too_many_lines)]
     async fn handle_put_inner(&self, request: ChunkPutRequest) -> ChunkPutResponse {
         let address = request.address;
         let addr_hex = hex::encode(address);
@@ -840,6 +863,12 @@ impl AntProtocol {
             }
         }
 
+        // 5b. A listed file's envelope: its payment, found while the proof is at hand.
+        let listing = match self.listing_for_put(&address, &request).await {
+            Ok(listing) => listing,
+            Err(response) => return response,
+        };
+
         // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
@@ -886,12 +915,37 @@ impl AntProtocol {
                     }
                 }
 
+                self.record_listing(listing).await;
                 ChunkPutResponse::Success { address }
             }
             Err(e) => {
                 warn!("Failed to store chunk {addr_hex}: {e}");
                 ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
+        }
+    }
+
+    /// For a listed file's envelope, the listing to record once the chunk is
+    /// stored, found from the PUT's payment proof. `Err` is the response that
+    /// refuses the PUT, so the client can retry with the right proof.
+    async fn listing_for_put(
+        &self,
+        address: &XorName,
+        request: &ChunkPutRequest,
+    ) -> std::result::Result<Option<Listing>, ChunkPutResponse> {
+        let Some(listings) = &self.listings else {
+            return Ok(None);
+        };
+        listings
+            .listing_for_put(address, &request.content, request.payment_proof.as_deref())
+            .await
+            .map_err(|message| ChunkPutResponse::Error(ProtocolError::PaymentFailed(message)))
+    }
+
+    /// Keep a PUT's listing, once its chunk is stored.
+    async fn record_listing(&self, listing: Option<Listing>) {
+        if let (Some(listings), Some(listing)) = (&self.listings, listing) {
+            listings.record(listing).await;
         }
     }
 

@@ -556,6 +556,10 @@ impl NodeBuilder {
 
         // Create payment verifier
         let evm_network = config.payment.evm_network.clone().into_evm_network();
+        // Listings check payments on the same chain, through the same vault.
+        let listings_rpc_url = evm_network.rpc_url().to_string();
+        let mut listings_vault = [0u8; 20];
+        listings_vault.copy_from_slice(evm_network.payment_vault_address().as_slice());
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network,
@@ -597,8 +601,18 @@ impl NodeBuilder {
             // is paid for rather than riding the first one.
             .with_payments(Arc::clone(&payment_verifier));
 
+        // Listings for envelope chunks, kept beside the chunks under the same root.
+        let listings = crate::listings::ListingService::new(
+            &config.root_dir,
+            Arc::clone(&storage),
+            listings_rpc_url,
+            listings_vault,
+        )
+        .await?;
+
         let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
-            .with_pointer_service(pointers);
+            .with_pointer_service(pointers)
+            .with_listing_service(listings);
 
         info!(
             "ANT protocol handler initialized with ML-DSA-65 signing (protocol={CHUNK_PROTOCOL_ID})"
@@ -1160,6 +1174,7 @@ impl RunningNode {
         let semaphore = Arc::new(Semaphore::new(64));
         let children = self.protocol_children.clone();
         let stopping = self.shutdown.clone();
+        let listings = protocol.listing_service().cloned();
 
         self.protocol_task = Some(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
@@ -1170,6 +1185,21 @@ impl RunningNode {
                     ..
                 } = event
                 {
+                    if topic == ant_listings::TOPIC {
+                        if let Some(listings) = listings.clone() {
+                            Self::answer_listings_request(
+                                listings,
+                                Arc::clone(&p2p),
+                                source,
+                                data,
+                                semaphore.clone(),
+                                stopping.clone(),
+                                &children,
+                            );
+                        }
+                        continue;
+                    }
+
                     let handler_info: Option<(&str, &str)> = if topic == CHUNK_PROTOCOL_ID {
                         Some(("chunk", CHUNK_PROTOCOL_ID))
                     } else {
@@ -1220,6 +1250,40 @@ impl RunningNode {
             }
         }));
         info!("Protocol message routing started");
+    }
+
+    /// Answer one message on the listings topic, under the same concurrency
+    /// limit and shutdown rule as chunk requests.
+    fn answer_listings_request(
+        listings: Arc<crate::listings::ListingService>,
+        p2p: Arc<P2PNode>,
+        source: saorsa_core::identity::PeerId,
+        data: Vec<u8>,
+        semaphore: Arc<Semaphore>,
+        stopping: CancellationToken,
+        children: &TaskTracker,
+    ) {
+        children.spawn(async move {
+            let _permit = tokio::select! {
+                biased;
+                () = stopping.cancelled() => return,
+                permit = semaphore.acquire() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
+            if stopping.is_cancelled() {
+                return;
+            }
+            if let Some(response) = listings.handle_message(&data).await {
+                if let Err(e) = p2p
+                    .send_message(&source, ant_listings::TOPIC, response, &[])
+                    .await
+                {
+                    warn!("Failed to send listings response to {source}: {e}");
+                }
+            }
+        });
     }
 
     /// Request the node to shut down.

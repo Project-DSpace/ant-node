@@ -253,7 +253,15 @@ pub struct ChunkStore {
     /// then the copier's write lands and resurrects it. One critical section per key,
     /// held across put, delete and copy, is what closes that.
     key_locks: Vec<tokio::sync::Mutex<()>>,
+    /// Told of each chunk [`Self::put`] newly writes, whichever path wrote it:
+    /// client PUTs, replication and repair alike. Set once, by the listings
+    /// service.
+    stored_observer: std::sync::OnceLock<StoredObserver>,
 }
+
+/// A function told of each newly stored chunk: see
+/// [`ChunkStore::set_stored_observer`].
+pub type StoredObserver = Box<dyn Fn(&XorName, &[u8]) + Send + Sync>;
 
 impl ChunkStore {
     /// Open the store under `config.root_dir`.
@@ -371,6 +379,7 @@ impl ChunkStore {
             key_locks: std::iter::repeat_with(|| tokio::sync::Mutex::new(()))
                 .take(KEY_LOCK_LANES)
                 .collect(),
+            stored_observer: std::sync::OnceLock::new(),
         };
 
         let (file_keys, legacy_keys) = store.split_counts();
@@ -490,6 +499,25 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if the content does not hash to `address`, the disk is
     /// too full, or the write fails.
     pub async fn put(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        let stored = self.put_unobserved(address, content).await?;
+        if stored {
+            if let Some(observer) = self.stored_observer.get() {
+                observer(address, content);
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Set the function told of each chunk [`Self::put`] newly writes. Only the
+    /// first call has an effect.
+    pub fn set_stored_observer(&self, observer: StoredObserver) {
+        if self.stored_observer.set(observer).is_err() {
+            warn!("A stored-chunk observer is already set; keeping the first");
+        }
+    }
+
+    /// [`Self::put`], without telling the stored-chunk observer.
+    async fn put_unobserved(&self, address: &XorName, content: &[u8]) -> Result<bool> {
         // Shared, for the reason given on the field: retirement waits for the legacy
         // environment to go idle, and a write that keeps starting new work in it while
         // that wait runs makes the wait unbounded. It also stops a write inserting a key

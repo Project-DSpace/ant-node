@@ -816,6 +816,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-listings"
+version = "0.1.0"
+source = "git+https://github.com/Project-DSpace/ant-listings?rev=a135dfe6fa36581e9086e569ec5462edae279868#a135dfe6fa36581e9086e569ec5462edae279868"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "ant-merkle"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -829,6 +842,7 @@ name = "ant-node"
 version = "0.21.0+ds.1"
 dependencies = [
  "alloy",
+ "ant-listings",
  "ant-protocol",
  "bao",
  "blake3",
