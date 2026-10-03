@@ -213,7 +213,10 @@ for f in "$LOGS"/*.log "$LOGS"/node-*/logs/*.log; do
     if [[ -f "$f" ]]; then log_start[$f]=$(stat -c %s "$f"); fi
 done
 
-as_user ant node daemon run --listen-addr 127.0.0.1 --port "$MANAGER_PORT" --log-path "$LOGS/manager" &
+# Started as a plain command, not through as_user: bash runs a function put in
+# the background in a subshell, and $! would be that subshell, not the manager.
+setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
+    ant node daemon run --listen-addr 127.0.0.1 --port "$MANAGER_PORT" --log-path "$LOGS/manager" &
 manager_pid=$!
 # Ready once its API answers (`ant node daemon status` succeeds even before).
 for attempt in $(seq 1 60); do
@@ -251,9 +254,14 @@ logs_pid=$!
 shutdown() {
     echo "Stopping nodes"
     manager stop >/dev/null 2>&1 || true
+    # The manager exits on SIGINT. The nodes are stopped by now, so if it
+    # hasn't exited 10 seconds later, kill it rather than run out docker
+    # stop's timeout.
     kill -INT "$manager_pid" 2>/dev/null || true
+    { sleep 10; kill -KILL "$manager_pid" 2>/dev/null; } &
+    watchdog=$!
     wait "$manager_pid" 2>/dev/null || true
-    kill "$logs_pid" 2>/dev/null || true
+    kill "$watchdog" "$logs_pid" 2>/dev/null || true
     pkill -x tail 2>/dev/null || true
     exit 0
 }
