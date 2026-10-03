@@ -952,6 +952,10 @@ impl Devnet {
                 .clone()
                 .unwrap_or(EvmNetwork::ArbitrumOne),
         };
+        // Listings check payments on the same chain, as on a production node.
+        let listings_rpc_url = evm_config.network.rpc_url().to_string();
+        let mut listings_vault = [0u8; 20];
+        listings_vault.copy_from_slice(evm_config.network.payment_vault_address().as_slice());
 
         let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let replication_config = ReplicationConfig::default();
@@ -982,9 +986,19 @@ impl Devnet {
             .with_chunk_store(Arc::clone(&storage))
             .with_payments(Arc::clone(&payment_verifier));
 
+        let listings = crate::listings::ListingService::new(
+            storage.root_dir(),
+            Arc::clone(&storage),
+            listings_rpc_url,
+            listings_vault,
+        )
+        .await
+        .map_err(|e| DevnetError::Startup(format!("Failed to open listing store: {e}")))?;
+
         Ok(
             AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
-                .with_pointer_service(pointers),
+                .with_pointer_service(pointers)
+                .with_listing_service(listings),
         )
     }
 
@@ -1100,6 +1114,19 @@ impl Devnet {
                         ..
                     } = event
                     {
+                        if topic == ant_listings::TOPIC {
+                            if let Some(listings) = protocol_clone.listing_service().cloned() {
+                                let p2p = Arc::clone(&p2p_clone);
+                                tokio::spawn(async move {
+                                    if let Some(response) = listings.handle_message(&data).await {
+                                        let _ = p2p
+                                            .send_message(&source, ant_listings::TOPIC, response, &[])
+                                            .await;
+                                    }
+                                });
+                            }
+                            continue;
+                        }
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
                                 "Node {node_index} received chunk protocol message from {source}"
