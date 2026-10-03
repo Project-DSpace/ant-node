@@ -42,10 +42,11 @@ wait_for() { # container pattern [count] [seconds]
 peer_ids() { sudo sh -c "cat $1/nodes/node-*/webrtc-direct.multiaddr" 2>/dev/null | sed 's#.*/p2p/##' | sort | tr '\n' ' '; }
 registry() { sudo jq -r "$2" "$1/manager/ant/node_registry.json"; }
 
-echo "== seed node (no bootstrap peers: starts an isolated network)"
-docker run -d --name seed "${COMMON[@]}" -e MANAGER_PORT=12601 -e NODE_COUNT=1 -e PORT_START=10900 -e BOOTSTRAP_PEERS="" \
-    -v "$WORK/seed:/data" "$IMAGE" >/dev/null
+echo "== seed node (its only bootstrap peer is itself: starts an isolated network)"
+docker run -d --name seed "${COMMON[@]}" -e MANAGER_PORT=12601 -e NODE_COUNT=1 -e PORT_START=10900 \
+    -e PUBLIC_IP=$IP -e BOOTSTRAP_PEERS="$IP:10900" -v "$WORK/seed:/data" "$IMAGE" >/dev/null
 wait_for seed 'Running 1 node' 1 60 || fail "seed did not start"
+[[ "$(registry "$WORK/seed" '.nodes["1"].bootstrap_peers | length')" == 0 ]] || fail "the seed lists itself as a bootstrap peer"
 
 echo "== three nodes joining the seed, browser ports 11910-11912"
 run_smoke() { # node_count [port_start]

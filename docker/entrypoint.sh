@@ -74,6 +74,15 @@ node_env() {
     (IFS=,; echo "${env[*]}")
 }
 
+# A node's bootstrap peers, one per line: BOOTSTRAP_PEERS without the node's
+# own address, so a seed node never dials itself.
+node_bootstrap() {
+    local peer
+    for peer in "${bootstrap[@]}"; do
+        [[ -n "$PUBLIC_IP" && "$peer" == "$PUBLIC_IP:$1" ]] || echo "$peer"
+    done
+}
+
 # ---------- disk layout ----------
 
 # Like Autonomi's node manager, every node runs its own copy of the node
@@ -169,8 +178,10 @@ if [[ -s "$REGISTRY" ]]; then
             echo "Moving node-$id from UDP port $port to $new: PORT_START is $PORT_START"
             port=$new
         fi
-        jq --arg id "$id" --argjson port "$port" --arg env "$(node_env "$port")" '
+        jq --arg id "$id" --argjson port "$port" --arg env "$(node_env "$port")" \
+           --argjson boot "$(node_bootstrap "$port" | jq -R . | jq -s .)" '
             .nodes[$id].node_port = $port
+          | .nodes[$id].bootstrap_peers = $boot
           | .nodes[$id].env_variables |= (with_entries(select(.key
                 | IN("ANT_WEBRTC_DIRECT_PORT", "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR", "ANT_EVM_RPC_URL") | not))
               + ($env | split(",") | map(split("=") | {key: .[0], value: (.[1:] | join("="))}) | from_entries))' \
@@ -196,7 +207,8 @@ while :; do
     port=$(free_port)
     args=(--count 1 --rewards-address "$REWARDS_ADDRESS" --node-port "$port" --path /opt/ant/ant-node
           --data-dir-path "$NODES" --log-dir-path "$LOGS" --env "$(node_env "$port")")
-    if (( ${#bootstrap[@]} > 0 )); then args+=(--bootstrap "$(IFS=,; echo "${bootstrap[*]}")"); fi
+    peers=$(node_bootstrap "$port" | paste -sd, -)
+    if [[ -n "$peers" ]]; then args+=(--bootstrap "$peers"); fi
     manager add "${args[@]}" >/dev/null
     echo "Added node on UDP port $port"
 done
