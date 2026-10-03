@@ -120,7 +120,8 @@ echo "evicted: $evicted of 3"
 docker exec evict nodes status >/dev/null || fail "node manager not answering after evictions"
 
 echo "== a data folder mounted noexec is refused"
-docker run -d --name noexec "${COMMON[@]}" -e MANAGER_PORT=12604 --tmpfs /data:rw,noexec,size=100m -e NODE_COUNT=1 \n    -e PORT_START=10940 "$IMAGE" >/dev/null
+docker run -d --name noexec "${COMMON[@]}" -e MANAGER_PORT=12604 --tmpfs /data:rw,noexec,size=100m -e NODE_COUNT=1 \
+    -e PORT_START=10940 "$IMAGE" >/dev/null
 wait_for noexec 'mounted noexec' 1 30 || fail "a noexec data folder was not refused"
 
 echo "All smoke tests passed"
