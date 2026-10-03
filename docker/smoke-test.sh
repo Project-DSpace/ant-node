@@ -10,8 +10,8 @@
 # previous image's /data/node-<port> layout is taken over with identities
 # kept; lowering NODE_COUNT retires a node; changing PORT_START moves the
 # nodes with identities kept; docker stop is clean and timely;
-# and the node manager's disk-pressure eviction removes nodes (never the last)
-# when the disk is nearly full.
+# the node manager's disk-pressure eviction removes nodes (never the last)
+# when the disk is nearly full; and a data folder mounted noexec is refused.
 set -euo pipefail
 
 IMAGE=${1:?usage: smoke-test.sh <image>}
@@ -22,13 +22,13 @@ COMMON=(--network host --stop-timeout 120 -e REWARDS_ADDRESS=$WALLET -e PUID=$(i
 
 fail() {
     echo "FAILED: $*"
-    for c in seed smoke evict; do
+    for c in seed smoke evict noexec; do
         docker ps -a --format '{{.Names}}' | grep -qx $c || continue
         echo "--- $c log (last 40 lines)"; docker logs $c 2>&1 | grep -vE '^\s*$' | tail -40
     done
     exit 1
 }
-cleanup() { docker rm -f seed smoke evict >/dev/null 2>&1 || true; sudo rm -rf "$WORK"; }
+cleanup() { docker rm -f seed smoke evict noexec >/dev/null 2>&1 || true; sudo rm -rf "$WORK"; }
 trap cleanup EXIT
 
 count() { docker logs "$1" 2>&1 | grep -cE "$2" || true; }
@@ -104,7 +104,7 @@ echo "stopped in ${took}s, exit code $code"
 (( $(count smoke 'Stopping nodes') >= 1 )) || fail "nodes were not stopped by the entrypoint"
 
 echo "== disk-pressure eviction on a 1.5 GB disk"
-docker run -d --name evict "${COMMON[@]}" -e MANAGER_PORT=12603 --tmpfs /data:rw,size=1500m -e NODE_COUNT=3 -e PORT_START=10930 \
+docker run -d --name evict "${COMMON[@]}" -e MANAGER_PORT=12603 --tmpfs /data:rw,exec,size=1500m -e NODE_COUNT=3 -e PORT_START=10930 \
     -e BOOTSTRAP_PEERS="$IP:10900" "$IMAGE" >/dev/null
 wait_for evict 'Running 3 node' 1 60 || fail "eviction test nodes did not start"
 (( $(count evict 'WARNING: only [0-9]+ GiB free') >= 1 )) || fail "no low-disk warning at startup"
@@ -118,5 +118,9 @@ done
 echo "evicted: $evicted of 3"
 (( evicted == 2 )) || fail "expected 2 of 3 nodes evicted (never the last), got $evicted"
 docker exec evict nodes status >/dev/null || fail "node manager not answering after evictions"
+
+echo "== a data folder mounted noexec is refused"
+docker run -d --name noexec "${COMMON[@]}" -e MANAGER_PORT=12604 --tmpfs /data:rw,noexec,size=100m -e NODE_COUNT=1 \n    -e PORT_START=10940 "$IMAGE" >/dev/null
+wait_for noexec 'mounted noexec' 1 30 || fail "a noexec data folder was not refused"
 
 echo "All smoke tests passed"

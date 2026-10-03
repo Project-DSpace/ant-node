@@ -76,6 +76,13 @@ node_env() {
 
 # ---------- disk layout ----------
 
+# Like Autonomi's node manager, every node runs its own copy of the node
+# program from its folder (so it can upgrade itself), which needs a data
+# folder where programs can run.
+if [[ ",$(findmnt -no OPTIONS --target /data 2>/dev/null || true)," == *,noexec,* ]]; then
+    fail "The data folder is on a file system mounted noexec, but nodes run their own copy of the node program from it. Use a data folder where programs can run."
+fi
+
 mkdir -p "$STATE" "$NODES" "$LOGS" "$RETIRED"
 chown "$PUID:$PGID" /data /data/manager "$STATE" "$NODES" "$LOGS" "$RETIRED"
 
@@ -267,9 +274,18 @@ shutdown() {
 }
 trap shutdown TERM INT
 
-manager start >/dev/null
+result=$(manager start --json 2>&1) || true
+if started=$(jq -er '(.started // [] | length) + (.already_running // [] | length)' <<<"$result" 2>/dev/null); then
+    failed=$(jq -r '(.failed // [])[] | "  node-\(.node_id): \(.error)"' <<<"$result")
+else
+    started=0 failed="  $result"
+fi
+if [[ -n "$failed" ]]; then
+    echo "WARNING: $((target - started)) of $target node(s) did not start:"
+    echo "$failed"
+fi
 if (( BROWSER_PORT_START == 0 )); then browser=off; else browser="UDP $BROWSER_PORT_START-$((BROWSER_PORT_START + NODE_COUNT - 1))"; fi
-echo "Running $target node(s) on UDP ports $PORT_START-$((PORT_START + NODE_COUNT - 1)); browser access: $browser; storage fees go to $REWARDS_ADDRESS"
+echo "Running $started node(s) on UDP ports $PORT_START-$((PORT_START + NODE_COUNT - 1)); browser access: $browser; storage fees go to $REWARDS_ADDRESS"
 manager status || true
 
 wait "$manager_pid" || true
