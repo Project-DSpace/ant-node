@@ -8,7 +8,8 @@
 # Checks: nodes start and join; browser addresses are published on the fixed
 # ports; a restart keeps node identities and starts the nodes again; the
 # previous image's /data/node-<port> layout is taken over with identities
-# kept; lowering NODE_COUNT retires a node; docker stop is clean and timely;
+# kept; lowering NODE_COUNT retires a node; changing PORT_START moves the
+# nodes with identities kept; docker stop is clean and timely;
 # and the node manager's disk-pressure eviction removes nodes (never the last)
 # when the disk is nearly full.
 set -euo pipefail
@@ -47,8 +48,8 @@ docker run -d --name seed "${COMMON[@]}" -e MANAGER_PORT=12601 -e NODE_COUNT=1 -
 wait_for seed 'Running 1 node' 1 60 || fail "seed did not start"
 
 echo "== three nodes joining the seed, browser ports 11910-11912"
-run_smoke() { # node_count
-    docker run -d --name smoke "${COMMON[@]}" -e MANAGER_PORT=12602 -e NODE_COUNT=$1 -e PORT_START=10910 \
+run_smoke() { # node_count [port_start]
+    docker run -d --name smoke "${COMMON[@]}" -e MANAGER_PORT=12602 -e NODE_COUNT=$1 -e PORT_START=${2:-10910} \
         -e BROWSER_PORT_START=11910 -e PUBLIC_IP=$IP -e BOOTSTRAP_PEERS="$IP:10900" \
         -v "$WORK/smoke:/data" "$IMAGE" >/dev/null
 }
@@ -83,6 +84,16 @@ run_smoke 2
 wait_for smoke 'Retiring node-3 \(port 10912\)' 1 60 || fail "node-3 was not retired"
 wait_for smoke 'Running 2 node' 1 60 || fail "2 nodes did not start"
 sudo sh -c "ls -d $WORK/smoke/retired/*-node-3" >/dev/null || fail "node-3's data was not kept in /data/retired"
+
+echo "== changing PORT_START moves the nodes, identities kept"
+docker stop -t 120 smoke >/dev/null && docker rm smoke >/dev/null
+ids=$(peer_ids "$WORK/smoke")
+run_smoke 2 10920
+wait_for smoke 'Moving node-2 from UDP port 10911 to 10921' 1 60 || fail "nodes were not moved to the new ports"
+wait_for smoke 'Running 2 node' 1 60 || fail "moved nodes did not start"
+[[ "$(registry "$WORK/smoke" '[.nodes[].node_port] | sort | join(",")')" == "10920,10921" ]] || fail "ports not changed"
+[[ "$(peer_ids "$WORK/smoke")" == "$ids" ]] || fail "identities changed when moving ports"
+wait_for smoke '\[node-[0-9]+\].*Successfully connected to [1-9]' 2 || fail "moved nodes did not rejoin the seed"
 
 echo "== docker stop stops the nodes cleanly"
 start=$(date +%s); docker stop -t 120 smoke >/dev/null; took=$(( $(date +%s) - start ))

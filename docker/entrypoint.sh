@@ -8,10 +8,10 @@
 #
 # On every start: check the settings, clear process files left by the last
 # run, take over nodes from the previous image's layout, move nodes onto a
-# newer node binary if the image has one, bring the manager's registry in line
-# with these settings, add or retire nodes to match NODE_COUNT, then start the
-# manager and the nodes and stream their logs. docker stop stops the nodes
-# before the manager.
+# newer node binary if the image has one, retire nodes above NODE_COUNT, bring
+# the manager's registry in line with these settings (moving nodes if the
+# ports changed), add nodes up to NODE_COUNT, then start the manager and the
+# nodes and stream their logs. docker stop stops the nodes before the manager.
 set -euo pipefail
 
 STATE=/data/manager/ant              # the manager's registry and process files
@@ -114,56 +114,79 @@ for copy in "$NODES"/node-*/ant-node; do
     fi
 done
 
-# ---------- registry: match the settings, then NODE_COUNT ----------
-
-if [[ -s "$REGISTRY" ]]; then
-    tmp=$(mktemp)
-    jq --arg rewards "$REWARDS_ADDRESS" --argjson boot "$(printf '%s\n' "${bootstrap[@]}" | jq -R . | jq -s 'map(select(. != ""))')" \
-        '.nodes |= with_entries(.value.rewards_address = $rewards | .value.bootstrap_peers = $boot)' \
-        "$REGISTRY" > "$tmp"
-    for id in $(jq -r '.nodes | keys[]' "$tmp"); do
-        port=$(jq -r --arg id "$id" '.nodes[$id].node_port' "$tmp")
-        env=$(node_env "$port")
-        jq --arg id "$id" --arg env "$env" '
-            .nodes[$id].env_variables |= (with_entries(select(.key
-                | IN("ANT_WEBRTC_DIRECT_PORT", "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR", "ANT_EVM_RPC_URL") | not))
-              + ($env | split(",") | map(split("=") | {key: .[0], value: (.[1:] | join("="))}) | from_entries))' \
-            "$tmp" > "$tmp.next" && mv "$tmp.next" "$tmp"
-    done
-    install -m 644 -o "$PUID" -g "$PGID" "$tmp" "$REGISTRY" && rm -f "$tmp"
-fi
+# ---------- registry: NODE_COUNT, then the settings ----------
 
 registered() { if [[ -s "$REGISTRY" ]]; then jq -r "$1" "$REGISTRY"; fi; }
-evicted=$(registered '[.nodes[] | select(.eviction != null)] | length')
-evicted=${evicted:-0}
-if (( evicted > 0 )); then
-    echo "$evicted node(s) were removed by the node manager because the disk was nearly full and stay removed:" \
-        "free up space, then run 'docker exec <container> nodes clear-evicted' and restart the container to replace them."
-fi
-target=$((NODE_COUNT - evicted))
 
-# Lowering NODE_COUNT retires the nodes on the highest ports; their data is
-# kept in $RETIRED for 3 days in case the change is undone.
-for id in $(registered '.nodes | to_entries | map(select(.value.eviction == null)) | sort_by(.value.node_port) | reverse | .[].key'); do
-    active=$(registered '[.nodes[] | select(.eviction == null)] | length')
-    (( active > target )) || break
+# The lowest storage port in PORT_START..PORT_START+NODE_COUNT-1 that no
+# registered node has.
+free_port() {
+    local used=" $(registered '[.nodes[].node_port] | map(tostring) | join(" ")') " index
+    for ((index = 0; index < NODE_COUNT; index++)); do
+        [[ "$used" == *" $((PORT_START + index)) "* ]] || break
+    done
+    echo $((PORT_START + index))
+}
+
+# Lowering NODE_COUNT removes nodes from the registry: first any the manager
+# evicted (their data is already gone), then running ones from the highest
+# port down, whose data is kept in $RETIRED for 3 days in case the change is
+# undone.
+for id in $(registered '.nodes | to_entries | sort_by(.value.eviction == null, -(.value.node_port // 0)) | .[].key'); do
+    (( $(registered '.nodes | length') > NODE_COUNT )) || break
     port=$(registered ".nodes[\"$id\"].node_port")
-    echo "Retiring node-$id (port $port): NODE_COUNT is $NODE_COUNT"
+    if [[ "$(registered ".nodes[\"$id\"].eviction != null")" == true ]]; then
+        echo "Dismissing evicted node-$id: NODE_COUNT is $NODE_COUNT"
+    else
+        echo "Retiring node-$id (port $port): NODE_COUNT is $NODE_COUNT"
+    fi
     manager dismiss "$id" >/dev/null
     stamp=$(date -u +%Y%m%dT%H%M%S)
     if [[ -d "$NODES/node-$id" ]]; then mv "$NODES/node-$id" "$RETIRED/$stamp-node-$id"; fi
     if [[ -d "$LOGS/node-$id" ]]; then mv "$LOGS/node-$id" "$RETIRED/$stamp-node-$id-logs"; fi
 done
 
-# Raising it (or a first start) adds nodes on the lowest free ports.
+# Every node takes these settings. A running node whose port is outside
+# PORT_START..PORT_START+NODE_COUNT-1 (PORT_START was changed) moves to the
+# lowest free port in it, keeping its identity and data.
+if [[ -s "$REGISTRY" ]]; then
+    tmp=$(mktemp)
+    jq --arg rewards "$REWARDS_ADDRESS" --argjson boot "$(printf '%s\n' "${bootstrap[@]}" | jq -R . | jq -s 'map(select(. != ""))')" \
+        '.nodes |= with_entries(.value.rewards_address = $rewards | .value.bootstrap_peers = $boot)' \
+        "$REGISTRY" > "$tmp"
+    install -m 644 -o "$PUID" -g "$PGID" "$tmp" "$REGISTRY"
+    for id in $(registered '.nodes | to_entries | map(select(.value.eviction == null)) | sort_by(.value.node_port) | .[].key'); do
+        port=$(registered ".nodes[\"$id\"].node_port")
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < PORT_START || port >= PORT_START + NODE_COUNT )); then
+            new=$(free_port)
+            echo "Moving node-$id from UDP port $port to $new: PORT_START is $PORT_START"
+            port=$new
+        fi
+        jq --arg id "$id" --argjson port "$port" --arg env "$(node_env "$port")" '
+            .nodes[$id].node_port = $port
+          | .nodes[$id].env_variables |= (with_entries(select(.key
+                | IN("ANT_WEBRTC_DIRECT_PORT", "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR", "ANT_EVM_RPC_URL") | not))
+              + ($env | split(",") | map(split("=") | {key: .[0], value: (.[1:] | join("="))}) | from_entries))' \
+            "$REGISTRY" > "$tmp"
+        install -m 644 -o "$PUID" -g "$PGID" "$tmp" "$REGISTRY"
+    done
+    rm -f "$tmp"
+fi
+
+evicted=$(registered '[.nodes[] | select(.eviction != null)] | length')
+evicted=${evicted:-0}
+if (( evicted > 0 )); then
+    echo "$evicted node(s) were removed by the node manager because the disk was nearly full and stay removed:" \
+        "free up space, then run 'docker exec <container> nodes clear-evicted' and restart the container to replace them," \
+        "or lower NODE_COUNT to run fewer nodes."
+fi
+target=$((NODE_COUNT - evicted))
+
+# Raising NODE_COUNT (or a first start) adds nodes on the lowest free ports.
 while :; do
     active=$(registered '[.nodes[] | select(.eviction == null)] | length')
     (( ${active:-0} < target )) || break
-    used=" $(registered '[.nodes[].node_port] | map(tostring) | join(" ")') "
-    for ((index = 0; index < NODE_COUNT; index++)); do
-        [[ "$used" == *" $((PORT_START + index)) "* ]] || break
-    done
-    port=$((PORT_START + index))
+    port=$(free_port)
     args=(--count 1 --rewards-address "$REWARDS_ADDRESS" --node-port "$port" --path /opt/ant/ant-node
           --data-dir-path "$NODES" --log-dir-path "$LOGS" --env "$(node_env "$port")")
     if (( ${#bootstrap[@]} > 0 )); then args+=(--bootstrap "$(IFS=,; echo "${bootstrap[*]}")"); fi

@@ -129,14 +129,19 @@ can confirm from the network side that your nodes are reachable.
 - **Status**: in the Unraid terminal, `docker exec storage-node nodes status`
   lists your nodes (use your container's name if it isn't `storage-node`).
 - **More or fewer nodes**: edit the container, change **Number of nodes** and
-  click **Apply**. Removed nodes' data is kept in `retired/` inside the data
-  folder for 3 days, in case you change your mind, then deleted.
+  click **Apply**. Fewer nodes removes any the disk-full check removed first
+  (see below), then the ones on the highest ports. Removed nodes' data is kept
+  in `retired/` inside the data folder for 3 days, in case you change your
+  mind, then deleted.
+- **Different ports**: change **First UDP port** or **First browser UDP port**
+  and click **Apply**. The nodes move to the new ports and keep their
+  identities; change your router's port forwarding to match.
 - **When the disk gets full**: like Autonomi's, the node manager watches free
   space where the data folder is. Below 1 GB free it warns in the log; below
   500 MB it removes the node holding the least data (never the last one) and
   deletes that node's data, so the others have room. Removed nodes stay
   removed: free up space, run `docker exec storage-node nodes clear-evicted`,
-  then restart the container to replace them.
+  then restart the container to replace them, or lower **Number of nodes**.
 - **No IPv6?** If the logs show connection problems and your connection has no
   working IPv6, set **IPv4 only** to `true` (under "Show more settings").
 
